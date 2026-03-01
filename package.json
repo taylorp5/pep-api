@@ -1,0 +1,10 @@
+{
+  "name": "pep",
+  "private": true,
+  "description": "Pep API + mobile app monorepo",
+  "scripts": {
+    "postinstall": "cd api && npm install",
+    "build": "cd api && npm install",
+    "start": "cd api && node index.js"
+  }
+}
