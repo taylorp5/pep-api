@@ -1662,7 +1662,19 @@ app.post("/pep-audio", async (req, res) => {
     const segmentPauseByTone = { easy: 1200, steady: 800, direct: 400, blunt: 400, no_excuses: 500 };
     const segmentPauseMs = segmentPauseByTone[tone] ?? 450;
     const defaultPauseSeconds = segmentPauseMs / 1000;
-    const segmentsWithPauses = parseScriptWithCues(scriptText, defaultPauseSeconds);
+    let segmentsWithPauses = parseScriptWithCues(scriptText, defaultPauseSeconds);
+    const maxSegments = 20;
+    if (segmentsWithPauses.length > maxSegments) {
+      const merged = [];
+      const chunkSize = Math.ceil(segmentsWithPauses.length / maxSegments);
+      for (let i = 0; i < segmentsWithPauses.length; i += chunkSize) {
+        const chunk = segmentsWithPauses.slice(i, i + chunkSize);
+        const text = chunk.map((s) => s.text).join("\n\n");
+        const pauseAfter = chunk.length > 0 ? chunk[chunk.length - 1].pauseAfterSeconds : defaultPauseSeconds;
+        if (text.trim()) merged.push({ text: text.trim(), pauseAfterSeconds: pauseAfter });
+      }
+      segmentsWithPauses = merged;
+    }
     const useChunked = segmentsWithPauses.length > 1;
     const ttsSpeed = (finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f") ? 0.88 : 1.0;
 
