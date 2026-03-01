@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "f5df05f9-347c-4107-9c4a-08ecdbc684f6"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.taylorp5.api",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    }
+  }
+}

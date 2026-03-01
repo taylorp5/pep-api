@@ -1,0 +1,8 @@
+# Render: API service runs from the api/ subdirectory only.
+# In Dashboard: set Root Directory to "api", Build to "npm install", Start to "npm start".
+services:
+  - type: web
+    name: pep-api
+    rootDir: api
+    buildCommand: npm install
+    startCommand: npm start
