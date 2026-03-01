@@ -588,7 +588,7 @@ function getToneSpecificPrompt(tone, wordTargets, outcome, obstacle, isLongForm,
       vocabulary: "Use validating language: 'it's understandable', 'that makes sense', 'you're feeling', 'it's okay to'. Include permission-based phrasing: 'you can', 'maybe', 'consider', 'perhaps'.",
       opening: "Start with validation and understanding. Acknowledge their struggle gently.",
       closing: "End with a softer, encouraging close. Use phrases like 'You've got this' or 'Take your time'.",
-      pacing: "Slower pacing. More space between thoughts. Use longer paragraphs.",
+      pacing: "Slower pacing. More space between thoughts. Use longer paragraphs. BREATHING: After each 'Breathe in' or 'Breathe out', put [PAUSE 4] or [PAUSE 5] on its own line so the listener has real time (e.g. 'Breathe in.' newline '[PAUSE 4]' newline 'Breathe out.' newline '[PAUSE 4]'). REPEAT-AFTER-ME: When you say 'Repeat after me' or 'Say it with me', put the phrase on the next line, then [PAUSE 4] on its own line so the user has 4 seconds to say it (e.g. 'Say it with me.' newline 'I am enough.' newline '[PAUSE 4]'). Do not rush; leave room for silence.",
     },
     steady: {
       sentenceLength: "Use medium-length sentences. Balanced rhythm.",
@@ -650,7 +650,7 @@ You MUST include ALL of the following. These create a live, video-speech feel wi
 
 1. At least 1 CALL-AND-RESPONSE block:
    Use cues like: "Say it with me." / "Again." / "What are you?" / "Repeat after me." / "Tell me."
-   Then the phrase to repeat. Use short lines. Include pause cues (e.g. "Again." on its own line).
+   Then the phrase to repeat on the next line. After the phrase, put [PAUSE 4] on its own line so the user has 4 seconds to say it. Use short lines.
    Example:
    Say it with me.
    
@@ -747,7 +747,7 @@ ${structureGuidance}
 
 ENDING: Last line must be a complete closing (e.g. "Do it." "Now."). Never end mid-thought or with a question. Final command on its own line after blank lines. No exclamation points.
 
-OPTIONAL: You may add [PAUSE 0.8] or [BEAT] on their own line for pacing; they are stripped for TTS.
+PACING FOR 120s/180s: Write for SLOW, deliberate delivery. Use 2-3 blank lines between major sections. For easy/calm tone, when you include breathing or body exercises, add [PAUSE 4] or [PAUSE 5] on its own line after each step (e.g. after "Breathe in." and "Breathe out.") so the listener has real time to follow. Optional: [PAUSE 0.8] or [BEAT] for shorter pauses; they are stripped for TTS.
 
 OUTPUT: Short lines, blank lines between sections. Preserve blank lines. Return ONLY the script. No quotes. Target ${wordTargets.min}-${wordTargets.max} words. Original only. Safe and motivational.`;
   }
@@ -877,8 +877,9 @@ ENDING (CRITICAL - AVOID ABRUPT CUTOFF):
 OPTIONAL DELIVERY CUES (for consistent pacing):
 - You MAY add optional cues on their own line to control pause length. These are stripped for TTS and reading view.
 - [PAUSE 0.8] = 0.8 second silence after the previous line(s). Use decimals: 0.5, 1.0, 1.2, etc. (max ~5s).
+- [PAUSE 4] or [PAUSE 5] = use after breathing/body instructions (e.g. "Breathe in." then [PAUSE 4] then "Breathe out.") so the listener has real time to follow. For easy/calm tone with breathing exercises, this is important.
 - [BEAT] = short beat pause (~0.3s). Use after a key word or before a punchline.
-- Example: "You know what you need to do.\n\n[PAUSE 1.0]\n\nDo it." creates a 1-second pause before "Do it."
+- For 120s/180s: write for SLOW, deliberate delivery. Use 2-3 blank lines between sections. When including breathing or body steps, add [PAUSE 4] after each step.
 - Cues are optional; blank lines still create default pauses. Use cues when you want precise, consistent pacing.
 
 OUTPUT FORMAT (CRITICAL):
@@ -943,7 +944,7 @@ app.post("/pep", async (req, res) => {
       60: { min: 220, max: 260 },
       90: { min: 330, max: 380 },
       120: { min: 320, max: 380 },
-      180: { min: 420, max: 500 }, // Flow 3-min cap
+      180: { min: 600, max: 680 }, // Flow 3-min: enough words + slower TTS speed to fill ~3 min
       300: { min: 700, max: 850 },
     };
 
@@ -982,7 +983,7 @@ app.post("/pep", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "echo",
+      calm_f: "nova",
     };
     
     let openAIVoice = "alloy"; // Default for free users
@@ -1199,11 +1200,11 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     const displayText = ensureEndsOnSentence(stripCuesToDisplay(finalScript));
     const scriptForTts = stripCuesForTts(finalScript);
 
-    // Segment pause (default) by tone for chunked playback
-    // Slightly tighter defaults to avoid overly long gaps between segments.
-    const segmentPauseByTone = { easy: 200, steady: 250, direct: 325, blunt: 325, no_excuses: 500 };
+    // Segment pause (default) by tone for chunked playback. Easy/steady get longer pauses for breathing/repeat-after-me.
+    const segmentPauseByTone = { easy: 1200, steady: 800, direct: 400, blunt: 400, no_excuses: 500 };
     const segmentPauseMs = segmentPauseByTone[tone] ?? 450;
     const defaultPauseSeconds = segmentPauseMs / 1000;
+    const ttsSpeedPep = (finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f") ? 0.88 : 1.0;
 
     // Parse script into segments (by cues and/or blank lines); cues control per-segment pause.
     // For short peps (â‰¤30s), skip chunked TTS entirely to keep generation fast and avoid extra pauses.
@@ -1224,13 +1225,13 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
           for (let i = 0; i < segmentsWithPauses.length; i++) {
             const { text, pauseAfterSeconds } = segmentsWithPauses[i];
             if (!text) continue;
-            const segMp3 = await client.audio.speech.create({ model: "gpt-4o-mini-tts", voice: openAIVoice, input: text });
+            const segMp3 = await client.audio.speech.create({ model: "gpt-4o-mini-tts", voice: openAIVoice, input: text, speed: ttsSpeedPep });
             let segBuf = Buffer.from(await segMp3.arrayBuffer());
             if (finalTargetSeconds > 30) segBuf = await normalizeAudioToLufs(segBuf);
             sendLine({ type: "segment", index: i, audioBase64: segBuf.toString("base64"), pauseAfterSeconds });
           }
         } else {
-          const fullMp3 = await client.audio.speech.create({ model: "gpt-4o-mini-tts", voice: openAIVoice, input: scriptForTts });
+          const fullMp3 = await client.audio.speech.create({ model: "gpt-4o-mini-tts", voice: openAIVoice, input: scriptForTts, speed: ttsSpeedPep });
           let fullBuf = Buffer.from(await fullMp3.arrayBuffer());
           if (finalTargetSeconds > 30) fullBuf = await normalizeAudioToLufs(fullBuf);
           sendLine({ type: "segment", index: 0, audioBase64: fullBuf.toString("base64"), pauseAfterSeconds: 0 });
@@ -1249,11 +1250,12 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
     // ----- Non-streaming path: full TTS then optional chunked response
     // Full-script TTS for save-to-library (no cue tokens sent to TTS)
-    console.log(`ðŸŽ¤ Generating full TTS: ${scriptForTts.length} chars (cues stripped), openAIVoice: ${openAIVoice}`);
+    console.log(`ðŸŽ¤ Generating full TTS: ${scriptForTts.length} chars (cues stripped), openAIVoice: ${openAIVoice}, speed: ${ttsSpeedPep}`);
     const fullMp3 = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: openAIVoice,
       input: scriptForTts,
+      speed: ttsSpeedPep,
     });
     let fullBuf = Buffer.from(await fullMp3.arrayBuffer());
     if (finalTargetSeconds > 30) fullBuf = await normalizeAudioToLufs(fullBuf);
@@ -1272,6 +1274,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
           model: "gpt-4o-mini-tts",
           voice: openAIVoice,
           input: text,
+          speed: ttsSpeedPep,
         });
         let segBuf = Buffer.from(await segMp3.arrayBuffer());
         if (finalTargetSeconds > 30) segBuf = await normalizeAudioToLufs(segBuf);
@@ -1374,7 +1377,7 @@ app.post("/pep-script", async (req, res) => {
       60: { min: 220, max: 260 },
       90: { min: 330, max: 380 },
       120: { min: 320, max: 380 },
-      180: { min: 420, max: 500 },
+      180: { min: 600, max: 680 },
       300: { min: 700, max: 850 },
     };
 
@@ -1408,7 +1411,7 @@ app.post("/pep-script", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "echo",
+      calm_f: "nova",
     };
     let openAIVoice = "alloy";
     if (voiceProfileId) {
@@ -1643,7 +1646,7 @@ app.post("/pep-audio", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "echo",
+      calm_f: "nova",
     };
     let openAIVoice = "alloy";
     if (voiceProfileId) {
@@ -1656,11 +1659,49 @@ app.post("/pep-audio", async (req, res) => {
     console.log(`[AUDIO] TTS voice: profile=${voiceProfileId || "default"} -> openAIVoice=${openAIVoice}`);
     console.log(`ðŸŽ¤ [AUDIO] Generating TTS only: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}, voiceProfileId=${voiceProfileId || "default"}`);
 
+    const segmentPauseByTone = { easy: 1200, steady: 800, direct: 400, blunt: 400, no_excuses: 500 };
+    const segmentPauseMs = segmentPauseByTone[tone] ?? 450;
+    const defaultPauseSeconds = segmentPauseMs / 1000;
+    const segmentsWithPauses = parseScriptWithCues(scriptText, defaultPauseSeconds);
+    const useChunked = segmentsWithPauses.length > 1;
+    const ttsSpeed = (finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f") ? 0.88 : 1.0;
+
+    if (useChunked) {
+      const segmentBase64s = [];
+      const segmentPauseDurations = [];
+      for (let i = 0; i < segmentsWithPauses.length; i++) {
+        const { text, pauseAfterSeconds } = segmentsWithPauses[i];
+        if (!text) continue;
+        const segMp3 = await client.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: openAIVoice,
+          input: text,
+          speed: ttsSpeed,
+        });
+        let segBuf = Buffer.from(await segMp3.arrayBuffer());
+        if (finalTargetSeconds > 30) segBuf = await normalizeAudioToLufs(segBuf);
+        segmentBase64s.push(segBuf.toString("base64"));
+        segmentPauseDurations.push(pauseAfterSeconds);
+      }
+      if (tier === "free") dailyCounts.free++;
+      else if (tier === "pro") dailyCounts.pro++;
+      logUsage(tier, scriptText.length, clientIP);
+      const estDurationMs = Math.round(Math.max(20, (scriptText.split(/\s+/).filter((w) => w.length > 0).length / 150) * 60) * 1000);
+      return res.json({
+        requestId: requestId || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        segmentBase64s,
+        segmentPauseDurations,
+        segmentPauseMs,
+        durationMs: estDurationMs,
+      });
+    }
+
     const scriptForTts = stripCuesForTts(scriptText);
     const fullMp3 = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: openAIVoice,
       input: scriptForTts,
+      speed: ttsSpeed,
     });
     let fullBuf = Buffer.from(await fullMp3.arrayBuffer());
     if (finalTargetSeconds > 30) fullBuf = await normalizeAudioToLufs(fullBuf);
