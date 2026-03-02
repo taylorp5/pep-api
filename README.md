@@ -25,6 +25,14 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Testing subscriptions (Expo Go vs development build)
+
+- **Expo Go:** The app runs in Expo Go. RevenueCat’s native module is not available there, so you **cannot complete a real purchase** in Expo Go. To test Pro/Flow without paying:
+  1. Open **Profile**.
+  2. Tap the **“Your Plan”** card **5 times** quickly to enable **Dev mode**.
+  3. Open **Advanced** and tap **Pro** or **Flow** to set the entitlement override. The app will behave as if you have that plan (custom peps, save, Play All, etc.).
+- **Real purchases:** To test buying or restoring a subscription, use a **development build** (e.g. `npx expo run:ios` or `npx expo run:android`, or EAS Build), then use iOS Sandbox or Android test tracks.
+
 ## Get a fresh project
 
 When you're ready, run:
