@@ -122,8 +122,8 @@ function ensureEndsOnSentence(text) {
     return trimmed;
   }
   const tail = trimmed.slice(lastPunctIndex + 1).trim();
-  // If tail is a very short fragment, drop it and end at the last full sentence
-  if (tail.length > 0 && tail.length <= 25) {
+  // If tail is a very short fragment (and not a complete short sentence like "Now." or "Go."), drop it
+  if (tail.length > 0 && tail.length <= 25 && !/[.!?]$/.test(tail)) {
     return trimmed.slice(0, lastPunctIndex + 1).trim();
   }
   return trimmed;
@@ -867,7 +867,8 @@ PUNCTUATION & PACING:
 ${structureGuidance}
 
 ENDING (CRITICAL - AVOID ABRUPT CUTOFF):
-- The LAST LINE must be a complete, decisive closing. Never end mid-thought, mid-sentence, or with an open-ended question.
+- The LAST LINE must be a complete, decisive closing with a clear tone of finality. Never end mid-thought, mid-sentence, or with an open-ended question.
+- End with one short, commanding line (e.g. "Now." "Go." "Do it." "You've got this.") so the pep lands as complete. The final line must be spoken in full and not cut off.
 - End with a single, final sentence that lands with finality (e.g. "Do it." "Now." "Go." "Start."). The pep must never sound cut off.
 - Use blank lines for pauses before the final command. Put the final command on its own line after blank lines for emphasis.
 - NO exclamation points. The ending should feel calm, slow, and commanding.
@@ -983,7 +984,7 @@ app.post("/pep", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "nova",
+      calm_f: "sage",
     };
     
     let openAIVoice = "alloy"; // Default for free users
@@ -1201,7 +1202,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     const scriptForTts = stripCuesForTts(finalScript);
 
     // Segment pause (default) by tone for chunked playback. Easy/steady get longer pauses for breathing/repeat-after-me.
-    const segmentPauseByTone = { easy: 1200, steady: 800, direct: 400, blunt: 400, no_excuses: 500 };
+    const segmentPauseByTone = { easy: 500, steady: 400, direct: 350, blunt: 350, no_excuses: 450 };
     const segmentPauseMs = segmentPauseByTone[tone] ?? 450;
     const defaultPauseSeconds = segmentPauseMs / 1000;
     const ttsSpeedPep = (finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f") ? 0.88 : 1.0;
@@ -1411,7 +1412,7 @@ app.post("/pep-script", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "nova",
+      calm_f: "coral",
     };
     let openAIVoice = "alloy";
     if (voiceProfileId) {
@@ -1646,7 +1647,7 @@ app.post("/pep-audio", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "nova",
+      calm_f: "coral",
     };
     let openAIVoice = "alloy";
     if (voiceProfileId) {
@@ -1657,56 +1658,12 @@ app.post("/pep-audio", async (req, res) => {
       openAIVoice = VOICE_PROFILE_MAP[voiceProfileId];
     }
     console.log(`[AUDIO] TTS voice: profile=${voiceProfileId || "default"} -> openAIVoice=${openAIVoice}`);
-    console.log(`ðŸŽ¤ [AUDIO] Generating TTS only: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}, voiceProfileId=${voiceProfileId || "default"}`);
+    console.log(`🎤 [AUDIO] Generating TTS only: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}, voiceProfileId=${voiceProfileId || "default"}`);
 
-    const segmentPauseByTone = { easy: 1200, steady: 800, direct: 400, blunt: 400, no_excuses: 500 };
-    const segmentPauseMs = segmentPauseByTone[tone] ?? 450;
-    const defaultPauseSeconds = segmentPauseMs / 1000;
-    let segmentsWithPauses = parseScriptWithCues(scriptText, defaultPauseSeconds);
-    const maxSegments = 20;
-    if (segmentsWithPauses.length > maxSegments) {
-      const merged = [];
-      const chunkSize = Math.ceil(segmentsWithPauses.length / maxSegments);
-      for (let i = 0; i < segmentsWithPauses.length; i += chunkSize) {
-        const chunk = segmentsWithPauses.slice(i, i + chunkSize);
-        const text = chunk.map((s) => s.text).join("\n\n");
-        const pauseAfter = chunk.length > 0 ? chunk[chunk.length - 1].pauseAfterSeconds : defaultPauseSeconds;
-        if (text.trim()) merged.push({ text: text.trim(), pauseAfterSeconds: pauseAfter });
-      }
-      segmentsWithPauses = merged;
-    }
-    const useChunked = segmentsWithPauses.length > 1;
-    const ttsSpeed = (finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f") ? 0.88 : 1.0;
-
-    if (useChunked) {
-      const segmentBase64s = [];
-      const segmentPauseDurations = [];
-      for (let i = 0; i < segmentsWithPauses.length; i++) {
-        const { text, pauseAfterSeconds } = segmentsWithPauses[i];
-        if (!text) continue;
-        const segMp3 = await client.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: openAIVoice,
-          input: text,
-          speed: ttsSpeed,
-        });
-        let segBuf = Buffer.from(await segMp3.arrayBuffer());
-        if (finalTargetSeconds > 30) segBuf = await normalizeAudioToLufs(segBuf);
-        segmentBase64s.push(segBuf.toString("base64"));
-        segmentPauseDurations.push(pauseAfterSeconds);
-      }
-      if (tier === "free") dailyCounts.free++;
-      else if (tier === "pro") dailyCounts.pro++;
-      logUsage(tier, scriptText.length, clientIP);
-      const estDurationMs = Math.round(Math.max(20, (scriptText.split(/\s+/).filter((w) => w.length > 0).length / 150) * 60) * 1000);
-      return res.json({
-        requestId: requestId || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-        segmentBase64s,
-        segmentPauseDurations,
-        segmentPauseMs,
-        durationMs: estDurationMs,
-      });
-    }
+    const ttsSpeed =
+      finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f"
+        ? 0.88
+        : 1.0;
 
     const scriptForTts = stripCuesForTts(scriptText);
     const fullMp3 = await client.audio.speech.create({
