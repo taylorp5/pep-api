@@ -1197,9 +1197,10 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     const blankLineCount = (finalScript.match(/\n\s*\n/g) || []).length;
     console.log(`âœ… Script generated: ${finalWordCount} words (target: ${wordTargets.min}-${wordTargets.max}), ${finalScript.length} chars, tier: ${tier}, targetSeconds: ${finalTargetSeconds}`);
 
-    // Clean display text (no delivery cues) for reading view and client display, and ensure it ends on a full sentence
+    // Clean display text (no delivery cues) for reading view and client display, and ensure it ends on a full sentence.
+    // Use this same text as the basis for TTS so the audio never ends on a dangling fragment (e.g. "three" with no closing sentence).
     const displayText = ensureEndsOnSentence(stripCuesToDisplay(finalScript));
-    const scriptForTts = stripCuesForTts(finalScript);
+    const scriptForTts = stripCuesForTts(displayText);
 
     // Segment pause (default) by tone for chunked playback. Easy/steady get longer pauses for breathing/repeat-after-me.
     const segmentPauseByTone = { easy: 500, steady: 400, direct: 350, blunt: 350, no_excuses: 450 };
@@ -1412,7 +1413,7 @@ app.post("/pep-script", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "coral",
+      calm_f: "sage",
     };
     let openAIVoice = "alloy";
     if (voiceProfileId) {
@@ -1647,7 +1648,7 @@ app.post("/pep-audio", async (req, res) => {
       coach_m: "alloy",
       coach_f: "nova",
       calm_m: "onyx",
-      calm_f: "coral",
+      calm_f: "sage",
     };
     let openAIVoice = "alloy";
     if (voiceProfileId) {
