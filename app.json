@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "340002ef-6f70-4773-a8b8-6efd52e7ca74"
+      }
+    },
+    "android": {
+      "package": "com.taylorp5.pep"
+    }
+  }
+}
