@@ -1,10 +1,57 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const fs = require("fs");
+const path = require("path");
 const OpenAI = require("openai");
 const { spawn } = require("child_process");
 
 dotenv.config();
+
+// Temp directory for pep audio files (served by URL, then deleted after send)
+const PEP_AUDIO_TEMP_DIR = process.env.PEP_AUDIO_TEMP_DIR || path.join(process.cwd(), "data", "pep-audio");
+
+/** Speech-friendly MP3 bitrate (64-96 kbps). */
+const TTS_MP3_BITRATE_KBPS = 80;
+
+/**
+ * Re-encode MP3 to speech-friendly bitrate. If ffmpeg fails, returns original buffer.
+ */
+function reencodeMp3ToSpeechBitrate(inputBuffer) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (buf) => {
+      if (!settled) {
+        settled = true;
+        resolve(buf);
+      }
+    };
+    const args = [
+      "-loglevel", "error", "-nostats",
+      "-i", "pipe:0",
+      "-b:a", `${TTS_MP3_BITRATE_KBPS}k`,
+      "-f", "mp3",
+      "pipe:1",
+    ];
+    const ff = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const chunks = [];
+    ff.stdout.on("data", (chunk) => chunks.push(chunk));
+    ff.stdout.on("end", () => {
+      if (chunks.length > 0) finish(Buffer.concat(chunks));
+      else finish(inputBuffer);
+    });
+    ff.on("error", () => finish(inputBuffer));
+    ff.stderr.on("data", (d) => { if (d.toString().trim()) console.warn("[ffmpeg bitrate]", d.toString().trim()); });
+    ff.on("close", (code) => {
+      if (!settled) {
+        if (code === 0 && chunks.length > 0) finish(Buffer.concat(chunks));
+        else finish(inputBuffer);
+      }
+    });
+    ff.stdin.write(inputBuffer);
+    ff.stdin.end();
+  });
+}
 
 /** Target LUFS for speech (broadcast-style consistent volume). */
 const TTS_LUFS_TARGET = -16;
@@ -362,6 +409,26 @@ Return ONLY the script text, no quotes, no formatting, just the raw text.`,
     audioBase64: audioBase64,
   };
 };
+
+function ensurePepAudioTempDir() {
+  if (!fs.existsSync(PEP_AUDIO_TEMP_DIR)) {
+    fs.mkdirSync(PEP_AUDIO_TEMP_DIR, { recursive: true });
+    console.log("Created pep audio temp dir:", PEP_AUDIO_TEMP_DIR);
+  }
+}
+
+function writeTempPepMp3(buffer) {
+  ensurePepAudioTempDir();
+  const id = `pep_${Date.now()}_${Math.random().toString(36).slice(2, 10)}.mp3`;
+  const filePath = path.join(PEP_AUDIO_TEMP_DIR, id);
+  fs.writeFileSync(filePath, buffer);
+  return id;
+}
+
+function getPepAudioUrl(req, fileId) {
+  const base = req.protocol + "://" + req.get("host");
+  return base.replace(/\/$/, "") + "/pep-audio/" + encodeURIComponent(fileId);
+}
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
@@ -1250,9 +1317,11 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       return;
     }
 
-    // ----- Non-streaming path: full TTS then optional chunked response
-    // Full-script TTS for save-to-library (no cue tokens sent to TTS)
-    console.log(`ðŸŽ¤ Generating full TTS: ${scriptForTts.length} chars (cues stripped), openAIVoice: ${openAIVoice}, speed: ${ttsSpeedPep}`);
+    // ----- Non-streaming path: full TTS, save to temp file, return audioUrl + timing logs
+    const totalAudioStart = Date.now();
+    console.log("[AUDIO] TTS request start");
+    const ttsStart = Date.now();
+
     const fullMp3 = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: openAIVoice,
@@ -1260,13 +1329,16 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       speed: ttsSpeedPep,
     });
     let fullBuf = Buffer.from(await fullMp3.arrayBuffer());
+    const ttsEnd = Date.now();
+    console.log("[AUDIO] TTS request end (" + (ttsEnd - ttsStart) + "ms)");
+
     if (finalTargetSeconds > 30) fullBuf = await normalizeAudioToLufs(fullBuf);
-    const audioBase64 = fullBuf.toString("base64");
+    fullBuf = await reencodeMp3ToSpeechBitrate(fullBuf);
 
     let audioSegments = null;
     let segmentPauseDurations = null;
     if (useChunkedTts) {
-      console.log(`ðŸŽ¤ Generating chunked TTS: ${segmentsWithPauses.length} segments (with cue-derived pauses)`);
+      console.log("Generating chunked TTS: " + segmentsWithPauses.length + " segments");
       const base64s = [];
       const pauseDurations = [];
       for (let i = 0; i < segmentsWithPauses.length; i++) {
@@ -1280,28 +1352,33 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
         });
         let segBuf = Buffer.from(await segMp3.arrayBuffer());
         if (finalTargetSeconds > 30) segBuf = await normalizeAudioToLufs(segBuf);
+        segBuf = await reencodeMp3ToSpeechBitrate(segBuf);
         base64s.push(segBuf.toString("base64"));
         pauseDurations.push(pauseAfterSeconds);
       }
       audioSegments = base64s;
       segmentPauseDurations = pauseDurations;
-      console.log(`âœ… Chunked TTS: ${audioSegments.length} segments, pauses: ${pauseDurations.map((p) => p + "s").join(", ")}`);
     }
 
-    console.log(`âœ… PEP generated successfully: script=${displayText.length} chars (display), tier=${tier}, audio=${audioBase64.length} base64 chars${audioSegments ? `, segments=${audioSegments.length}` : ""}`);
+    console.log("[AUDIO] audio file save start");
+    const saveStart = Date.now();
+    const audioFileId = writeTempPepMp3(fullBuf);
+    const audioUrl = getPepAudioUrl(req, audioFileId);
+    const saveEnd = Date.now();
+    console.log("[AUDIO] audio file save end (" + (saveEnd - saveStart) + "ms)");
+    const totalDuration = Date.now() - totalAudioStart;
+    console.log("[AUDIO] response sent (total audio generation: " + totalDuration + "ms)");
 
-    // Increment daily counter (only for free and pro, not flow)
     if (tier === "free") {
       dailyCounts.free++;
     } else if (tier === "pro") {
       dailyCounts.pro++;
     }
-
     logUsage(tier, displayText.length, clientIP);
 
     const payload = {
       scriptText: displayText,
-      audioBase64,
+      audioUrl,
       wordCount: finalWordCount,
       ...(audioSegments && audioSegments.length > 0
         ? { audioSegments, segmentPauseMs, segmentPauseDurations }
@@ -1601,6 +1678,25 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
   }
 });
 
+// Serve a temp pep audio file by id (then delete to free disk)
+app.get("/pep-audio/:id", (req, res) => {
+  const id = req.params.id;
+  if (!/^pep_[a-z0-9_.]+\\.mp3$/.test(id)) {
+    return res.status(400).json({ error: "Invalid audio id" });
+  }
+  const filePath = path.join(PEP_AUDIO_TEMP_DIR, id);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "Audio not found or expired" });
+  }
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.sendFile(filePath, (err) => {
+    if (!err) {
+      try { fs.unlinkSync(filePath); } catch (e) { console.warn("[pep-audio] cleanup failed:", e.message); }
+    }
+  });
+});
+
 // Audio-only endpoint: generate TTS from provided script
 app.post("/pep-audio", async (req, res) => {
   const clientIP = getClientIP(req);
@@ -1658,8 +1754,9 @@ app.post("/pep-audio", async (req, res) => {
       }
       openAIVoice = VOICE_PROFILE_MAP[voiceProfileId];
     }
-    console.log(`[AUDIO] TTS voice: profile=${voiceProfileId || "default"} -> openAIVoice=${openAIVoice}`);
-    console.log(`🎤 [AUDIO] Generating TTS only: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}, voiceProfileId=${voiceProfileId || "default"}`);
+    console.log("[AUDIO] TTS voice: profile=" + (voiceProfileId || "default") + " -> openAIVoice=" + openAIVoice);
+    const totalStart = Date.now();
+    console.log("[AUDIO] TTS request start");
 
     const ttsSpeed =
       finalTargetSeconds >= 120 || tone === "easy" || tone === "steady" || voiceProfileId === "calm_f"
@@ -1674,8 +1771,17 @@ app.post("/pep-audio", async (req, res) => {
       speed: ttsSpeed,
     });
     let fullBuf = Buffer.from(await fullMp3.arrayBuffer());
+    console.log("[AUDIO] TTS request end (" + (Date.now() - totalStart) + "ms)");
     if (finalTargetSeconds > 30) fullBuf = await normalizeAudioToLufs(fullBuf);
-    const audioBase64 = fullBuf.toString("base64");
+    fullBuf = await reencodeMp3ToSpeechBitrate(fullBuf);
+
+    console.log("[AUDIO] audio file save start");
+    const saveStart = Date.now();
+    const audioFileId = writeTempPepMp3(fullBuf);
+    const audioUrl = getPepAudioUrl(req, audioFileId);
+    console.log("[AUDIO] audio file save end (" + (Date.now() - saveStart) + "ms)");
+    const totalDuration = Date.now() - totalStart;
+    console.log("[AUDIO] response sent (total audio generation: " + totalDuration + "ms)");
 
     if (tier === "free") {
       dailyCounts.free++;
@@ -1687,8 +1793,8 @@ app.post("/pep-audio", async (req, res) => {
     const estDurationMs = Math.round(Math.max(20, (scriptText.split(/\s+/).filter((w) => w.length > 0).length / 150) * 60) * 1000);
 
     return res.json({
-      requestId: requestId || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      audioBase64,
+      requestId: requestId || (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8)),
+      audioUrl,
       durationMs: estDurationMs,
     });
   } catch (err) {
