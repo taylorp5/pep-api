@@ -2,10 +2,11 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { StyleSheet, TextInput, TouchableOpacity, ActivityIndicator, Alert, Platform, View, ScrollView, Animated, Pressable, Modal, KeyboardAvoidingView, ToastAndroid, Switch } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Audio, InterruptionModeAndroid } from 'expo-av';
+import * as Speech from 'expo-speech';
 import * as FileSystem from 'expo-file-system';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useRouter, useFocusEffect } from 'expo-router';
+import { useRouter, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import Constants from 'expo-constants';
 
 import { ThemedText } from '@/components/themed-text';
@@ -13,7 +14,7 @@ import { ThemedView } from '@/components/themed-view';
 import { useThemeColor } from '@/hooks/use-theme-color';
 import { useUser } from '@/contexts/UserContext';
 import { useAudioPlayback } from '@/contexts/AudioPlaybackContext';
-import { savePep, unsavePep, updatePepSession, type PepItem } from '@/services/PepLibrary';
+import { savePep, unsavePep, updatePepSession, loadSavedPeps, getPepById, type PepItem } from '@/services/PepLibrary';
 import { derivePepTitle } from '@/utils/derivePepTitle';
 import { pepTheme } from '@/constants/pep-theme';
 import {
@@ -34,6 +35,7 @@ import {
   getSkipFeedbackAfterPep,
   setSkipFeedbackAfterPep,
 } from '@/services/PepFeedback';
+import { notifyPepReady, isReminderSupported, getPepReadyEnabled } from '@/services/ReminderNotifications';
 import { recordPepProfileUsage, getUserPepProfileSummary, type UserPepProfileSummary } from '@/services/UserPepProfile';
 
 // API Configuration
@@ -252,7 +254,7 @@ const VOICE_PROFILES: Record<VoiceProfileId, { label: string; openAIVoice: strin
   },
   calm_f: { 
     label: 'Calm (Female)', 
-    openAIVoice: 'echo', 
+    openAIVoice: 'sage', 
     styleHint: 'calm, grounded, steady',
     descriptor: 'Calm, clear'
   },
@@ -323,17 +325,39 @@ const getTodayDailyPep = () => {
   return DAILY_PEP_ITEMS[index];
 };
 
-// Daily Pep Cache Keys
+// Daily Pep Cache Keys (v2: bumped to invalidate older, shorter peps)
 const DAILY_PEP_CACHE_KEYS = {
-  DATE: 'dailyPepDate',
-  TOPIC: 'dailyPepTopic',
-  QUOTE: 'dailyPepQuote',
-  AUDIO_URI: 'dailyPepAudioUri',
+  DATE: 'dailyPepDate_v2',
+  TOPIC: 'dailyPepTopic_v2',
+  QUOTE: 'dailyPepQuote_v2',
+  AUDIO_URI: 'dailyPepAudioUri_v2',
 };
 
 // Helper function to get today's date key
 const getTodayKey = (): string => {
   return getTodayDateString();
+};
+
+// Build Daily Pep script aimed at a minimum ~30s duration when spoken.
+// We keep it focused but add enough lines and pacing that TTS is
+// meaningfully longer than a single short quote.
+const buildDailyScriptForTts = (topic: string, quote: string): string => {
+  let script = `${quote} Today's focus is ${topic.toLowerCase()}. You know what you need to do. It's action. Movement creates clarity. Start now.`;
+
+  script +=
+    ' You do not need a perfect plan. You need a single clear action you can take in the next minute. Pick the smallest step that actually moves you forward.';
+
+  script +=
+    ' For the next half minute, stay with this. Breathe once, feel your feet on the floor, and commit to that one step. When your brain argues for comfort, remind yourself that relief comes from doing, not delaying.';
+
+  script +=
+    ' You have done harder things than this before. Prove it again right now. When this pep ends, you move immediately. No scrolling, no second guessing, just the next right action.';
+
+  // Cap overall length so TTS latency stays reasonable while still targeting ≥30s.
+  if (script.length > 900) {
+    script = truncateAtSentence(script, 900);
+  }
+  return script;
 };
 
 // Load cached daily pep data
@@ -633,14 +657,15 @@ export default function HomeScreen() {
   const [flowSessionId, setFlowSessionId] = useState<string | null>(null);
   const [flowSessionPartIndex, setFlowSessionPartIndex] = useState(0);
   const generateSessionId = () => `session-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  const hasHandledContinueFromLibraryRef = useRef(false);
 
-  // Feedback modal after pep finishes
-  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
-  const [feedbackPepId, setFeedbackPepId] = useState<string | null>(null);
-  const [feedbackPepKind, setFeedbackPepKind] = useState<'daily' | 'custom'>('daily');
-  const [feedbackStep, setFeedbackStep] = useState<'main' | 'reason'>('main');
-  const [feedbackText, setFeedbackText] = useState('');
-  const [skipFeedbackAfterPep, setSkipFeedbackAfterPepState] = useState(false);
+  // Feedback modal after pep finishes (disabled for production – kept for future use)
+  // const [showFeedbackModal, setShowFeedbackModal] = useState(false);
+  // const [feedbackPepId, setFeedbackPepId] = useState<string | null>(null);
+  // const [feedbackPepKind, setFeedbackPepKind] = useState<'daily' | 'custom'>('daily');
+  // const [feedbackStep, setFeedbackStep] = useState<'main' | 'reason'>('main');
+  // const [feedbackText, setFeedbackText] = useState('');
+  // const [skipFeedbackAfterPep, setSkipFeedbackAfterPepState] = useState(false);
 
   const scrollViewRef = useRef<ScrollView>(null);
   const customPepRef = useRef<View>(null);
@@ -654,10 +679,10 @@ export default function HomeScreen() {
   const backgroundColor = useThemeColor({}, 'background');
   const tintColor = useThemeColor({}, 'tint');
 
-  // Load "don't ask feedback after every pep" preference
-  useEffect(() => {
-    getSkipFeedbackAfterPep().then(setSkipFeedbackAfterPepState);
-  }, []);
+  // Load "don't ask feedback after every pep" preference (feedback modal disabled in production)
+  // useEffect(() => {
+  //   getSkipFeedbackAfterPep().then(setSkipFeedbackAfterPepState);
+  // }, []);
 
   // Load saved voice profile preference on mount and when entitlement changes
   useEffect(() => {
@@ -1030,9 +1055,11 @@ export default function HomeScreen() {
     loadCache().catch((err) => console.warn('[DAILY] loadCache promise rejected:', err));
   }, []);
 
-  // Background preload daily pep (non-Flow) when no cache for today so first tap is instant
+  // Background preload daily pep for all users when no cache for today so first tap is
+  // instant whenever possible. This kicks off as soon as we know today's topic/quote,
+  // right after app open.
   useEffect(() => {
-    if (!dailyTopic || !dailyQuote || dailyAudioUri || entitlement === 'flow') return;
+    if (!dailyTopic || !dailyQuote || dailyAudioUri) return;
     if (dailyPreloadStartedRef.current) return;
     if (apiBaseUrl.includes('localhost') || apiBaseUrl.includes('127.0.0.1')) return;
 
@@ -1042,10 +1069,7 @@ export default function HomeScreen() {
       const todayPep = getTodayDailyPep();
       const topic = todayPep.topic;
       const quote = todayPep.quote;
-      let dailyScript = `${quote} Today's focus is ${topic.toLowerCase()}. You know what you need to do. It's action. Movement creates clarity. Start now.`;
-      if (dailyScript.length > 380) {
-        dailyScript = truncateAtSentence(dailyScript, 380);
-      }
+      const dailyScript = buildDailyScriptForTts(topic, quote);
       try {
         const connectionTest = await testApiConnection(apiBaseUrl);
         if (!connectionTest.success) {
@@ -1054,12 +1078,15 @@ export default function HomeScreen() {
         }
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
-        const response = await fetch(`${apiBaseUrl}/tts`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: dailyScript, voice: 'alloy', singleVoice: true }),
-          signal: controller.signal,
-        }).finally(() => clearTimeout(timeout));
+        const dailyVoiceProfileId: VoiceProfileId = selectedVoiceProfileId ?? 'coach_m';
+const dailyOpenAIVoice = VOICE_PROFILES[dailyVoiceProfileId].openAIVoice;
+
+const response = await fetch(`${apiBaseUrl}/tts`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ text: dailyScript, voice: dailyOpenAIVoice, singleVoice: true }),
+  signal: controller.signal,
+}).finally(() => clearTimeout(timeout));
         if (!response.ok) {
           dailyLoadInProgressRef.current = false;
           return;
@@ -1105,7 +1132,7 @@ export default function HomeScreen() {
       } finally {
         dailyLoadInProgressRef.current = false;
       }
-    }, 800);
+    }, 0);
 
     return () => clearTimeout(timeoutId);
   }, [dailyTopic, dailyQuote, dailyAudioUri, entitlement, apiBaseUrl]);
@@ -1156,6 +1183,28 @@ export default function HomeScreen() {
       interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
     }).catch((e) => console.warn('[AUDIO] setAudioModeAsync failed:', e));
   }, []);
+
+  const toneToHonestyLevel = (tone: string | number): HonestyLevel => {
+    if (typeof tone === 'number') {
+      if (tone < 1) return 1;
+      if (tone > 5) return 5;
+      return tone as HonestyLevel;
+    }
+    switch (tone) {
+      case 'easy':
+        return 1;
+      case 'steady':
+        return 2;
+      case 'direct':
+        return 3;
+      case 'blunt':
+        return 4;
+      case 'no_excuses':
+        return 5;
+      default:
+        return 3;
+    }
+  };
 
   // Continuation tone: one step more intense (keeps tone consistent but progresses)
   const getContinuationTone = (tone: 'easy' | 'steady' | 'direct' | 'blunt' | 'no_excuses'): 'easy' | 'steady' | 'direct' | 'blunt' | 'no_excuses' => {
@@ -1501,6 +1550,7 @@ export default function HomeScreen() {
     const segmentBase64s = data.segmentBase64s as string[] | undefined;
     const segmentPauseDurations = data.segmentPauseDurations as number[] | undefined;
     const segmentPauseMsFromApi = data.segmentPauseMs as number | undefined;
+    const audioUrl = data.audioUrl as string | undefined;
     const audioBase64 = data.audioBase64 as string | undefined;
 
     const fs = FileSystem as any;
@@ -1534,13 +1584,19 @@ export default function HomeScreen() {
       };
     }
 
-    if (!audioBase64) {
+    if (!audioUrl && !audioBase64) {
       throw new Error('No audio received from server.');
     }
     const fileUri = `${cacheDir}${prefix}.mp3`;
-    await FileSystemLegacy.writeAsStringAsync(fileUri, audioBase64, {
-      encoding: FileSystemLegacy.EncodingType.Base64,
-    });
+    if (audioUrl) {
+      const downloadResult = await FileSystemLegacy.downloadAsync(audioUrl, fileUri);
+      if (downloadResult.status !== 200) throw new Error(`Audio download failed: ${downloadResult.status}`);
+      console.log('[PEP] Audio downloaded from URL (pep-audio)');
+    } else {
+      await FileSystemLegacy.writeAsStringAsync(fileUri, audioBase64!, {
+        encoding: FileSystemLegacy.EncodingType.Base64,
+      });
+    }
     await pruneAudioCache(cacheDir, MAX_AUDIO_CACHE_FILES);
     return { fileUri };
   };
@@ -1811,6 +1867,18 @@ export default function HomeScreen() {
       return;
     }
 
+    // Immediately enter loading state so users see feedback and can't double-tap Generate
+    setStatus('loading');
+    setLoadingPhase('writing');
+    setErrorMessage('');
+    setAudioUri(null);
+    setSavedCustomId(null);
+    setSegmentFileUris(null);
+    setSegmentPauseDurations(null);
+    setCustomPepPlaybackFinished(false);
+    setFlowSessionId(null);
+    setFlowSessionPartIndex(0);
+
     // Build cache key from inputs (same inputs => replay cached audio)
     let outcomeString: string | null = null;
     let obstacleString: string | null = null;
@@ -1859,33 +1927,12 @@ export default function HomeScreen() {
       return;
     }
 
-    setStatus('loading');
-    setLoadingPhase('writing');
-    setErrorMessage('');
-    setAudioUri(null);
-    setSavedCustomId(null);
-    setSegmentFileUris(null);
-    setSegmentPauseDurations(null);
-    setCustomPepPlaybackFinished(false);
-    setFlowSessionId(null);
-    setFlowSessionPartIndex(0);
-    
     // Stop any currently playing audio
     await stopPlayback();
 
     const tier: 'free' | 'pro' | 'flow' = entitlement;
     const generationId = ++generationIdRef.current;
     try {
-      setStatus('loading');
-      setLoadingPhase('writing');
-      setErrorMessage('');
-      setAudioUri(null);
-      setSavedCustomId(null);
-      setSegmentFileUris(null);
-      setSegmentPauseDurations(null);
-      setCustomPepPlaybackFinished(false);
-      setFlowSessionId(null);
-      setFlowSessionPartIndex(0);
       setAudioError(null);
 
       const { requestId, scriptText, wordCount: scriptWordCount } = await generatePepScriptOnly(
@@ -1933,6 +1980,14 @@ export default function HomeScreen() {
         segmentPauseMs: segPauseMs ?? 450,
         segmentPauseDurations: segPauseDurations ?? null,
       };
+      // If pep-ready notifications are enabled and supported (dev/standalone build), fire a "pep ready" notification.
+      if (isReminderSupported()) {
+        getPepReadyEnabled()
+          .then((enabled) => {
+            if (enabled) notifyPepReady('custom').catch(() => {});
+          })
+          .catch(() => {});
+      }
       recordCustomPepGenerated().catch(() => {});
       recordPepProfileUsage({
         intents: intentsToSend,
@@ -2019,6 +2074,11 @@ export default function HomeScreen() {
         obstacle: obstacleStr,
       });
 
+      const intentsToSend = [...selectedIntents];
+      const intentsForStorage = intentsToSend.length ? intentsToSend : null;
+      const intentOtherForStorage =
+        selectedIntents.includes('Other') && intentOther.trim() ? intentOther.trim() : null;
+
       const item = await savePep({
         kind: 'custom',
         title,
@@ -2029,6 +2089,9 @@ export default function HomeScreen() {
         lengthSecondsRequested: lengthSeconds,
         outcome: outcomeStr,
         obstacle: obstacleStr,
+        promptText: goalText.trim() || null,
+        intents: intentsForStorage,
+        intentOther: intentOtherForStorage,
         ...(flowSessionId ? { sessionId: flowSessionId, sessionPartIndex: flowSessionPartIndex } : {}),
       });
       setSavedCustomId(item.id);
@@ -2070,6 +2133,11 @@ export default function HomeScreen() {
         const outcomeStr = selectedOutcome === 'other' ? outcomeOther.trim() || null : (selectedOutcome && selectedOutcome !== 'skip' ? selectedOutcome : null);
         const obstacleStr = selectedObstacle === 'other' ? obstacleOther.trim() || null : (selectedObstacle && selectedObstacle !== 'skip' ? selectedObstacle : null);
         const title = derivePepTitle({ userText: goalText, outcome: outcomeStr, obstacle: obstacleStr });
+        const intentsToSend = [...selectedIntents];
+        const intentsForStorage = intentsToSend.length ? intentsToSend : null;
+        const intentOtherForStorage =
+          selectedIntents.includes('Other') && intentOther.trim() ? intentOther.trim() : null;
+
         const item = await savePep({
           kind: 'custom',
           title,
@@ -2080,6 +2148,9 @@ export default function HomeScreen() {
           lengthSecondsRequested: lengthSeconds,
           outcome: outcomeStr,
           obstacle: obstacleStr,
+          promptText: goalText.trim() || null,
+          intents: intentsForStorage,
+          intentOther: intentOtherForStorage,
           sessionId: sid,
           sessionPartIndex: 0,
         });
@@ -2204,6 +2275,9 @@ export default function HomeScreen() {
         lengthSecondsRequested: lengthSeconds,
         outcome: null,
         obstacle: null,
+        promptText: null,
+        intents: null,
+        intentOther: null,
       });
       setSavedDailyId(item.id);
       Alert.alert('Saved!', 'Your daily pep talk has been saved to your library.');
@@ -2349,7 +2423,7 @@ export default function HomeScreen() {
             profile.topIntents,
             null,
             profile.profileSummary,
-            30,
+            45,
             undefined
           );
           if (flowUri) {
@@ -2372,15 +2446,10 @@ export default function HomeScreen() {
         return;
       }
 
-      // Generate script locally (~20–30s when spoken) — kept short for faster TTS
+      // Generate script locally (~30–45s when spoken), kept lean enough that TTS is still fast
       setDailyDebug("Generating script...");
       console.log("[DAILY] Generating script...");
-      let dailyScript = `${quote} Today's focus is ${topic.toLowerCase()}. You know what you need to do. It's action. Movement creates clarity. Start now.`;
-
-      // Cap length so TTS stays quick
-      if (dailyScript.length > 380) {
-        dailyScript = truncateAtSentence(dailyScript, 380);
-      }
+      const dailyScript = buildDailyScriptForTts(topic, quote);
       setDailyDebug("Daily script length: " + dailyScript.length);
       console.log("[DAILY] Final script length:", dailyScript.length);
       
@@ -2390,8 +2459,13 @@ export default function HomeScreen() {
       // Call TTS API to get audio
       setDailyDebug("Fetching TTS...");
       console.log("[DAILY] Fetching TTS from:", `${apiBaseUrl}/tts`);
-      console.log("[DAILY] Request body:", JSON.stringify({ text: dailyScript.substring(0, 50) + '...', voice: 'alloy' }));
+      const dailyVoiceProfileId: VoiceProfileId = selectedVoiceProfileId ?? 'coach_m';
+      const dailyOpenAIVoice = VOICE_PROFILES[dailyVoiceProfileId].openAIVoice;
       
+      console.log(
+        "[DAILY] Request body:",
+        JSON.stringify({ text: dailyScript.substring(0, 50) + '...', voice: dailyOpenAIVoice })
+      );      
       // Test connection first
       const connectionTest = await testApiConnection(apiBaseUrl);
       if (!connectionTest.success) {
@@ -2412,8 +2486,8 @@ export default function HomeScreen() {
         },
         body: JSON.stringify({
           text: dailyScript,
-          voice: 'alloy',
-          singleVoice: true, // full script must be one voice (no mid-talk change)
+          voice: dailyOpenAIVoice,
+singleVoice: true, // full script must be one voice (no mid-talk change)
         }),
         signal: controller.signal,
       }).then((res) => {
@@ -2646,11 +2720,12 @@ export default function HomeScreen() {
                 .then(setHabitMetrics)
                 .catch(() => {});
             }
-            const pepId = source === 'daily' ? getTodayKey() : (id ?? `custom-${Date.now()}`);
-            setFeedbackPepId(pepId);
-            setFeedbackPepKind(source === 'daily' ? 'daily' : 'custom');
-            setFeedbackStep('main');
-            getSkipFeedbackAfterPep().then((skip) => { if (!skip) setShowFeedbackModal(true); });
+            // Feedback prompt disabled in production – preserve logic for future use.
+            // const pepId = source === 'daily' ? getTodayKey() : (id ?? `custom-${Date.now()}`);
+            // setFeedbackPepId(pepId);
+            // setFeedbackPepKind(source === 'daily' ? 'daily' : 'custom');
+            // setFeedbackStep('main');
+            // getSkipFeedbackAfterPep().then((skip) => { if (!skip) setShowFeedbackModal(true); });
           }
         }
       });
@@ -2730,10 +2805,11 @@ export default function HomeScreen() {
               setNowPlayingId(null);
               setCustomPepPlaybackFinished(true);
               recordPepPlayed(estimatedMinutes ?? 0).catch(() => {});
-              setFeedbackPepId(`custom-${Date.now()}`);
-              setFeedbackPepKind('custom');
-              setFeedbackStep('main');
-              getSkipFeedbackAfterPep().then((skip) => { if (!skip) setShowFeedbackModal(true); });
+              // Feedback prompt disabled in production – preserve logic for future use.
+              // setFeedbackPepId(`custom-${Date.now()}`);
+              // setFeedbackPepKind('custom');
+              // setFeedbackStep('main');
+              // getSkipFeedbackAfterPep().then((skip) => { if (!skip) setShowFeedbackModal(true); });
             }
           }
         });
@@ -2780,10 +2856,11 @@ export default function HomeScreen() {
           setCustomPepPlaybackFinished(true);
           const estimatedMinutes = (targetSeconds ?? 30) / 60;
           recordPepPlayed(estimatedMinutes).catch(() => {});
-          setFeedbackPepId(`custom-${Date.now()}`);
-          setFeedbackPepKind('custom');
-          setFeedbackStep('main');
-          getSkipFeedbackAfterPep().then((skip) => { if (!skip) setShowFeedbackModal(true); });
+          // Feedback prompt disabled in production – preserve logic for future use.
+          // setFeedbackPepId(`custom-${Date.now()}`);
+          // setFeedbackPepKind('custom');
+          // setFeedbackStep('main');
+          // getSkipFeedbackAfterPep().then((skip) => { if (!skip) setShowFeedbackModal(true); });
         }
         return;
       }
@@ -2875,7 +2952,18 @@ export default function HomeScreen() {
       Alert.alert('Playback failed', msg + '. Try generating again.');
     }
   };
-
+  const handleDeviceRead = () => {
+    if (!currentScriptText?.trim()) return;
+    try {
+      Speech.stop();
+      Speech.speak(currentScriptText, {
+        rate: 0.9,
+        pitch: 1.0,
+      });
+    } catch (e) {
+      console.warn('[TTS] Device read error:', e);
+    }
+  };
   // Custom pep: pause (segment or gap between segments)
   const handlePause = async () => {
     if (nowPlaying !== 'custom') return;
@@ -3029,54 +3117,164 @@ export default function HomeScreen() {
     setReadingModeTitle('');
   };
 
-  const closeFeedbackModal = () => {
-    setShowFeedbackModal(false);
-    setFeedbackStep('main');
-    setFeedbackPepId(null);
-    setFeedbackText('');
-  };
-
-  const handleFeedbackYeah = async () => {
-    if (!feedbackPepId) return;
-    const entry: PepFeedbackEntry = {
-      id: feedbackPepId,
-      kind: feedbackPepKind,
-      date: new Date().toISOString(),
-      rating: 'yeah',
-      ...(feedbackText.trim() ? { feedbackText: feedbackText.trim() } : {}),
-    };
-    await saveFeedback(entry);
-    closeFeedbackModal();
-  };
-
-  const handleFeedbackNotReally = () => {
-    setFeedbackStep('reason');
-  };
-
-  const handleFeedbackReason = async (reason: FeedbackReason) => {
-    if (!feedbackPepId) return;
-    const entry: PepFeedbackEntry = {
-      id: feedbackPepId,
-      kind: feedbackPepKind,
-      date: new Date().toISOString(),
-      rating: 'not_really',
-      reason,
-      ...(feedbackText.trim() ? { feedbackText: feedbackText.trim() } : {}),
-    };
-    await saveFeedback(entry);
-    if (reason === 'too_soft' || reason === 'too_intense') {
-      const nextLevel = await adjustDefaultHonestyFromFeedback(reason);
-      setHonestyLevel(nextLevel as HonestyLevel);
-    }
-    closeFeedbackModal();
-  };
-
-  const handleSkipFeedbackToggle = async (value: boolean) => {
-    setSkipFeedbackAfterPepState(value);
-    await setSkipFeedbackAfterPep(value);
-  };
+  // Feedback handlers (disabled in production – kept for future use)
+  // const closeFeedbackModal = () => {
+  //   setShowFeedbackModal(false);
+  //   setFeedbackStep('main');
+  //   setFeedbackPepId(null);
+  //   setFeedbackText('');
+  // };
+  //
+  // const handleFeedbackYeah = async () => {
+  //   if (!feedbackPepId) return;
+  //   const entry: PepFeedbackEntry = {
+  //     id: feedbackPepId,
+  //     kind: feedbackPepKind,
+  //     date: new Date().toISOString(),
+  //     rating: 'yeah',
+  //     ...(feedbackText.trim() ? { feedbackText: feedbackText.trim() } : {}),
+  //   };
+  //   await saveFeedback(entry);
+  //   closeFeedbackModal();
+  // };
+  //
+  // const handleFeedbackNotReally = () => {
+  //   setFeedbackStep('reason');
+  // };
+  //
+  // const handleFeedbackReason = async (reason: FeedbackReason) => {
+  //   if (!feedbackPepId) return;
+  //   const entry: PepFeedbackEntry = {
+  //     id: feedbackPepId,
+  //     kind: feedbackPepKind,
+  //     date: new Date().toISOString(),
+  //     rating: 'not_really',
+  //     reason,
+  //     ...(feedbackText.trim() ? { feedbackText: feedbackText.trim() } : {}),
+  //   };
+  //   await saveFeedback(entry);
+  //   if (reason === 'too_soft' || reason === 'too_intense') {
+  //     const nextLevel = await adjustDefaultHonestyFromFeedback(reason);
+  //     setHonestyLevel(nextLevel as HonestyLevel);
+  //   }
+  //   closeFeedbackModal();
+  // };
+  //
+  // const handleSkipFeedbackToggle = async (value: boolean) => {
+  //   setSkipFeedbackAfterPepState(value);
+  //   await setSkipFeedbackAfterPep(value);
+  // };
 
   const insets = useSafeAreaInsets();
+  const { continueSessionFrom } = useLocalSearchParams<{ continueSessionFrom?: string }>();
+
+  useEffect(() => {
+    if (!continueSessionFrom || hasHandledContinueFromLibraryRef.current) return;
+    hasHandledContinueFromLibraryRef.current = true;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const pep = await getPepById(continueSessionFrom);
+        if (!pep || cancelled) {
+          if (!pep) {
+            Alert.alert('Not found', 'That pep could not be found in your library.');
+          }
+          return;
+        }
+        if (pep.kind !== 'custom' || !pep.text || !pep.audioUriLocal) {
+          Alert.alert('Unavailable', 'This pep cannot be used to continue a session.');
+          return;
+        }
+
+        setShowCustomPep(true);
+
+        const promptFromPep =
+          (typeof pep.promptText === 'string' && pep.promptText.trim().length > 0
+            ? pep.promptText
+            : pep.title) || '';
+        setGoalText(promptFromPep);
+        setCurrentScriptText(pep.text);
+        setAudioUri(pep.audioUriLocal);
+        setCurrentVoiceProfileId(pep.voiceProfileId as VoiceProfileId);
+        if (VOICE_PROFILES[pep.voiceProfileId as VoiceProfileId]) {
+          setSelectedVoiceProfileId(pep.voiceProfileId as VoiceProfileId);
+        }
+        setHonestyLevel(toneToHonestyLevel(pep.intensityLevel));
+
+        const minLength = 30;
+        const maxLength = entitlement === 'flow' ? 180 : entitlement === 'pro' ? 90 : 30;
+        const length = pep.lengthSecondsRequested || minLength;
+        const clampedLength = Math.min(maxLength, Math.max(minLength, length));
+        setTargetSeconds(clampedLength);
+
+        const outcomeValue = pep.outcome ?? null;
+        if (outcomeValue) {
+          if ((PRO_OUTCOME_OPTIONS as readonly string[]).includes(outcomeValue)) {
+            setSelectedOutcome(outcomeValue as OutcomeOption);
+            setOutcomeOther('');
+            setShowOutcomeOther(false);
+          } else {
+            setSelectedOutcome('other');
+            setOutcomeOther(outcomeValue);
+            setShowOutcomeOther(true);
+          }
+        } else {
+          setSelectedOutcome(null);
+          setOutcomeOther('');
+          setShowOutcomeOther(false);
+        }
+
+        const obstacleValue = pep.obstacle ?? null;
+        if (obstacleValue) {
+          if ((PRO_OBSTACLE_OPTIONS as readonly string[]).includes(obstacleValue)) {
+            setSelectedObstacle(obstacleValue as ObstacleOption);
+            setObstacleOther('');
+            setShowObstacleOther(false);
+          } else {
+            setSelectedObstacle('other');
+            setObstacleOther(obstacleValue);
+            setShowObstacleOther(true);
+          }
+        } else {
+          setSelectedObstacle(null);
+          setObstacleOther('');
+          setShowObstacleOther(false);
+        }
+
+        const pepIntents = Array.isArray(pep.intents) ? pep.intents.map(String) : [];
+        setSelectedIntents(pepIntents);
+        if (pepIntents.includes('Other') && typeof pep.intentOther === 'string') {
+          setIntentOther(pep.intentOther);
+        } else {
+          setIntentOther('');
+        }
+
+        setSavedCustomId(pep.id);
+
+        if (pep.sessionId) {
+          setFlowSessionId(pep.sessionId);
+          setFlowSessionPartIndex(
+            typeof pep.sessionPartIndex === 'number' ? pep.sessionPartIndex : 0
+          );
+        } else {
+          setFlowSessionId(null);
+          setFlowSessionPartIndex(0);
+        }
+
+        await handleContinueSession();
+      } catch (e) {
+        if (cancelled) return;
+        console.warn('[Home] Failed to continue session from library:', e);
+        Alert.alert('Error', 'Could not start a continuation from that pep. Please try again.');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [continueSessionFrom, handleContinueSession]);
 
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
@@ -3155,7 +3353,7 @@ export default function HomeScreen() {
               <View style={styles.headerTextBlock}>
                 <ThemedText style={[styles.headerTitle, { color: theme.text }]}>Pep</ThemedText>
                 <ThemedText style={[styles.headerTagline, { color: theme.mutedText }]}>
-                  Do the thing.
+                  Make It Happen.
                 </ThemedText>
               </View>
             </Pressable>
@@ -3201,15 +3399,6 @@ export default function HomeScreen() {
                 <ThemedText style={[styles.streakCount, { color: theme.mutedText }]}>0</ThemedText>
               </View>
             )}
-          </View>
-        </View>
-
-        {/* Daily Pep status */}
-        <View style={styles.habitRow}>
-          <View style={[styles.habitChip, { backgroundColor: theme.surface }]}>
-            <ThemedText style={[styles.habitChipText, { color: theme.text }]}>
-              Daily Pep: {habitMetrics?.lastDailyPepPlayedDate === getHabitTodayKey() ? 'Played' : 'Not played'}
-            </ThemedText>
           </View>
         </View>
 
@@ -3313,7 +3502,7 @@ export default function HomeScreen() {
             </ThemedText>
           )}
 
-          {/* Read Toggle and Save Button / Upsell for Daily Pep */}
+          {/* Read and Save Button / Upsell for Daily Pep */}
           {dailyAudioUri && dailyScriptText && (
             <View style={styles.saveSection}>
               {/* Read Toggle (Pro/Flow only) */}
@@ -3327,7 +3516,6 @@ export default function HomeScreen() {
                   </ThemedText>
                 </TouchableOpacity>
               )}
-              
               {isPro ? (
                 savedDailyId ? (
                   <TouchableOpacity
@@ -3961,7 +4149,7 @@ export default function HomeScreen() {
         {(status === 'loading' || dailyIsLoading) && (
           <View style={[styles.progressContainer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
             <ThemedText style={[styles.progressText, { color: theme.text, fontWeight: '600' }]}>
-              {dailyIsLoading ? 'Daily Pep is loading…' : 'Your pep is on the way'}
+              {dailyIsLoading ? 'Daily Pep is loading…' : 'Your pep is on its way'}
             </ThemedText>
             <ThemedText style={[styles.progressText, { color: theme.mutedText }]}>
               {dailyIsLoading
@@ -3975,6 +4163,11 @@ export default function HomeScreen() {
             {!dailyIsLoading && (
               <ThemedText style={[styles.progressText, { color: theme.mutedText, marginTop: 4 }]}>
                 {`“${LOADING_QUOTES[loadingQuoteIndex]}”`}
+              </ThemedText>
+            )}
+            {!dailyIsLoading && status === 'loading' && (
+              <ThemedText style={[styles.progressHint, { color: theme.mutedText }]}>
+                Longer peps can take a bit to generate, but you&apos;ll be able to replay them instantly from your Library.
               </ThemedText>
             )}
           </View>
@@ -4094,21 +4287,36 @@ export default function HomeScreen() {
               opacity: fadeAnim,
               transform: [{ translateY: translateYAnim }],
             }}>
-            {/* Read Toggle (Pro/Flow only): visible during loading and ready; enabled once script is available */}
+            {/* Read options (Custom Pep only) */}
             {canRead && (
-              <TouchableOpacity
-                activeOpacity={0.7}
-                style={[
-                  styles.secondaryButton,
-                  { borderColor: theme.buttonBorder, marginBottom: 8 },
-                  !currentScriptText && styles.buttonDisabled,
-                ]}
-                onPress={() => currentScriptText && handleOpenReadingMode(currentScriptText, 'Custom Pep')}
-                disabled={!currentScriptText}>
-                <ThemedText style={[styles.secondaryButtonText, { color: theme.text }]}>
-                  {currentScriptText ? 'Read now' : 'Read when ready…'}
-                </ThemedText>
-              </TouchableOpacity>
+              <>
+                <TouchableOpacity
+                  activeOpacity={0.7}
+                  style={[
+                    styles.secondaryButton,
+                    { borderColor: theme.buttonBorder, marginBottom: 8 },
+                    !currentScriptText && styles.buttonDisabled,
+                  ]}
+                  onPress={() => currentScriptText && handleOpenReadingMode(currentScriptText, 'Custom Pep')}
+                  disabled={!currentScriptText}>
+                  <ThemedText style={[styles.secondaryButtonText, { color: theme.text }]}>
+                    {currentScriptText ? 'Read now' : 'Read when ready…'}
+                  </ThemedText>
+                </TouchableOpacity>
+                {currentScriptText && (
+                  <TouchableOpacity
+                    activeOpacity={0.7}
+                    style={[
+                      styles.secondaryButton,
+                      { borderColor: theme.buttonBorder, marginBottom: 8 },
+                    ]}
+                    onPress={handleDeviceRead}>
+                    <ThemedText style={[styles.secondaryButtonText, { color: theme.text }]}>
+                      Read with device voice
+                    </ThemedText>
+                  </TouchableOpacity>
+                )}
+              </>
             )}
 
             {/* Save / Continue are only relevant once pep is fully generated */}
@@ -4143,16 +4351,26 @@ export default function HomeScreen() {
                     </ThemedText>
                   </TouchableOpacity>
                 )}
-                {isFlow && customPepPlaybackFinished && (
-                  <TouchableOpacity
-                    activeOpacity={0.7}
-                    style={[styles.continueSessionButton, { backgroundColor: theme.accentWarmMuted, borderColor: theme.accentWarm }]}
-                    onPress={handleContinueSession}
-                    disabled={dailyIsLoading}>
-                    <ThemedText style={[styles.continueSessionText, { color: theme.accentWarm }]}>
-                      ▶ Continue Session
+                {isFlow && (
+                  <View style={{ marginTop: 8 }}>
+                    <TouchableOpacity
+                      activeOpacity={0.7}
+                      style={[
+                        styles.continueSessionButton,
+                        { backgroundColor: theme.accentWarmMuted, borderColor: theme.accentWarm, opacity: 0.6 },
+                      ]}
+                      disabled>
+                      <ThemedText style={[styles.continueSessionText, { color: theme.accentWarm }]}>
+                        ▶ Continue Session
+                      </ThemedText>
+                      <ThemedText style={[styles.continueSessionText, { color: theme.mutedText, fontSize: 12 }]}>
+                        Coming soon
+                      </ThemedText>
+                    </TouchableOpacity>
+                    <ThemedText style={[styles.progressHint, { color: theme.mutedText }]}>
+                      Coming soon: chain another pep that picks up where this one left off.
                     </ThemedText>
-                  </TouchableOpacity>
+                  </View>
                 )}
               </>
             )}
@@ -4229,68 +4447,16 @@ export default function HomeScreen() {
         </View>
       </Modal>
 
-      {/* Feedback after pep finishes */}
-      <Modal
-        visible={showFeedbackModal}
-        transparent
-        animationType="fade"
-        onRequestClose={closeFeedbackModal}>
-        <Pressable style={styles.feedbackOverlay} onPress={closeFeedbackModal}>
-          <Pressable style={[styles.feedbackCard, { backgroundColor: theme.surface }]} onPress={(e) => e.stopPropagation()}>
-            <ThemedText style={[styles.feedbackTitle, { color: theme.text }]}>Did that hit?</ThemedText>
-            <ThemedText style={[styles.feedbackLabel, { color: theme.mutedText }]}>Your feedback (optional)</ThemedText>
-            <TextInput
-              placeholder="Share your thoughts—what worked, what didn't, or anything else..."
-              placeholderTextColor={theme.mutedText}
-              value={feedbackText}
-              onChangeText={setFeedbackText}
-              multiline
-              numberOfLines={4}
-              textAlignVertical="top"
-              style={[styles.feedbackTextInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surfaceSoft }]}
-            />
-            {feedbackStep === 'main' ? (
-              <View style={styles.feedbackButtons}>
-                <TouchableOpacity
-                  activeOpacity={0.8}
-                  style={[styles.feedbackButton, { backgroundColor: theme.accentWarmMuted }]}
-                  onPress={handleFeedbackYeah}>
-                  <ThemedText style={[styles.feedbackButtonText, { color: theme.accentWarm }]}>Yeah</ThemedText>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  activeOpacity={0.8}
-                  style={[styles.feedbackButton, { backgroundColor: theme.surfaceSoft, borderColor: theme.border }]}
-                  onPress={handleFeedbackNotReally}>
-                  <ThemedText style={[styles.feedbackButtonText, { color: theme.text }]}>Not really</ThemedText>
-                </TouchableOpacity>
-              </View>
-            ) : (
-              <View style={styles.feedbackReasons}>
-                {(['too_soft', 'too_intense', 'too_generic', 'too_long'] as const).map((reason) => (
-                  <TouchableOpacity
-                    key={reason}
-                    activeOpacity={0.8}
-                    style={[styles.feedbackReasonButton, { backgroundColor: theme.surfaceSoft, borderColor: theme.border }]}
-                    onPress={() => handleFeedbackReason(reason)}>
-                    <ThemedText style={[styles.feedbackReasonText, { color: theme.text }]}>
-                      {reason === 'too_soft' ? 'Too soft' : reason === 'too_intense' ? 'Too intense' : reason === 'too_generic' ? 'Too generic' : 'Too long'}
-                    </ThemedText>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-            <View style={styles.feedbackSkipRow}>
-              <ThemedText style={[styles.feedbackSkipLabel, { color: theme.mutedText }]}>Don't ask for feedback after every pep</ThemedText>
-              <Switch
-                value={skipFeedbackAfterPep}
-                onValueChange={handleSkipFeedbackToggle}
-                trackColor={{ false: theme.border, true: theme.accentWarmMuted }}
-                thumbColor={theme.surface}
-              />
-            </View>
-          </Pressable>
-        </Pressable>
-      </Modal>
+      {/* Feedback after pep finishes (disabled in production; modal left here commented for future use) */}
+      {false && (
+        <Modal
+          visible={false}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {}}>
+          <View />
+        </Modal>
+      )}
       </ThemedView>
     </KeyboardAvoidingView>
     </View>
@@ -4702,6 +4868,10 @@ const styles = StyleSheet.create({
   progressText: {
     fontSize: 14,
   },
+   progressHint: {
+    fontSize: 12,
+    marginTop: 4,
+   },
   errorContainer: {
     padding: 18,
     borderRadius: 18,
