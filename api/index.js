@@ -1680,11 +1680,17 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
 // Serve a temp pep audio file by id (then delete to free disk)
 app.get("/pep-audio/:id", (req, res) => {
-  const id = req.params.id;
-  if (!/^pep_[a-z0-9_.]+\\.mp3$/.test(id)) {
+  const id = req.params.id || "";
+  let decoded;
+  try {
+    decoded = decodeURIComponent(id);
+  } catch (e) {
     return res.status(400).json({ error: "Invalid audio id" });
   }
-  const filePath = path.join(PEP_AUDIO_TEMP_DIR, id);
+  if (!/^pep_[a-z0-9_.]+\.mp3$/i.test(decoded)) {
+    return res.status(400).json({ error: "Invalid audio id" });
+  }
+  const filePath = path.join(PEP_AUDIO_TEMP_DIR, decoded);
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: "Audio not found or expired" });
   }
