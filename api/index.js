@@ -92,7 +92,7 @@ function normalizeAudioToLufs(inputBuffer) {
       }
     });
     ff.on("error", (err) => {
-      console.warn("âš ï¸ FFmpeg not available for LUFS normalization:", err.message);
+      console.warn("[WARN] ", err.message);
       finish(inputBuffer);
     });
     ff.stderr.on("data", (d) => {
@@ -232,7 +232,7 @@ const getTodayDate = () => {
 const checkAndResetDailyCounts = () => {
   const today = getTodayDate();
   if (dailyCounts.lastResetDate !== today) {
-    console.log(`ðŸ“… Resetting daily counts (was ${dailyCounts.lastResetDate}, now ${today})`);
+    console.log(`[INFO] Resetting daily counts (was ${dailyCounts.lastResetDate}, now ${today})`);
     dailyCounts = {
       free: 0,
       pro: 0,
@@ -297,7 +297,7 @@ const getClientIP = (req) => {
 // Usage logging
 const logUsage = (mode, scriptTextLength, ip) => {
   const timestamp = new Date().toISOString();
-  console.log(`ðŸ“Š Usage: ${timestamp} | IP: ${ip} | Mode: ${mode} | ScriptLength: ${scriptTextLength} chars`);
+  console.log(`[INFO] Usage: ${timestamp} | IP: ${ip} | Mode: ${mode} | ScriptLength: ${scriptTextLength} chars`);
 };
 
 // Initialize daily counts
@@ -440,12 +440,12 @@ app.get("/daily", async (req, res) => {
     
     // Check cache - if same date, return cached data
     if (dailyPepCache.date === today && dailyPepCache.data) {
-      console.log(`ðŸ“¦ Returning cached daily pep for ${today}`);
+      console.log(`[INFO] Returning cached daily pep for ${today}`);
       return res.json(dailyPepCache.data);
     }
 
     // Generate new daily pep
-    console.log(`ðŸŒ… Generating new daily pep for ${today}`);
+    console.log("[INFO] Generating new daily pep for " + today);
     const dailyPep = await generateDailyPep(today);
     
     // Cache it
@@ -454,11 +454,11 @@ app.get("/daily", async (req, res) => {
       data: dailyPep,
     };
 
-    console.log(`âœ… Daily pep generated: topic="${dailyPep.topic}", quote="${dailyPep.quote}", script=${dailyPep.scriptText.length} chars`);
+    console.log("[OK] Daily pep generated: topic=\"" + dailyPep.topic + "\", quote=\"" + dailyPep.quote + "\", script=" + dailyPep.scriptText.length + " chars");
     
     res.json(dailyPep);
   } catch (err) {
-    console.error("âŒ Daily pep error:", err.message);
+    console.error("[FAIL] Daily pep error:", err.message);
     
     // Provide helpful error messages
     if (err.message.includes("API key")) {
@@ -523,7 +523,7 @@ const evaluateRequestSafety = async (userText, keywordOnly = false) => {
   // Check for harmful patterns
   for (const pattern of harmfulPatterns) {
     if (pattern.test(userText)) {
-      console.log(`ðŸš« Pattern match detected: ${pattern}`);
+      console.log(`[INFO] Pattern match detected: ${pattern}`);
       return { isSafe: false, reason: "harmful_content" };
     }
   }
@@ -570,13 +570,13 @@ Respond with ONLY "SAFE" or "UNSAFE" followed by a brief reason (one sentence).`
     const isUnsafe = evaluation.toUpperCase().startsWith("UNSAFE");
     
     if (isUnsafe) {
-      console.log(`ðŸš« OpenAI evaluation: ${evaluation}`);
+      console.log(`[INFO] OpenAI evaluation: ${evaluation}`);
       return { isSafe: false, reason: "evaluated_unsafe" };
     }
   } catch (err) {
     console.error("Safety evaluation error:", err.message);
     // If safety check fails, proceed with caution (log it)
-    console.warn("âš ï¸ Safety evaluation failed, proceeding with request");
+    console.warn("[WARN] ");
   }
   
   return { isSafe: true };
@@ -646,6 +646,35 @@ Generate a refusal response in Pep's voice that redirects to something construct
   
   return refusalText;
 };
+
+/**
+ * Expansion pass: expand existing script to target word range without full regenerate.
+ * Preserves tone, structure, repetition, and pacing. Call once when initial script is under minimum.
+ */
+async function expandScriptToTarget(client, existingScript, wordTargets, userText, outcome, obstacle) {
+  const minWords = wordTargets.min;
+  const maxWords = wordTargets.max;
+  const expansionPrompt = `You are Pep. Your job is to EXPAND an existing pep talk script to reach ${minWords}-${maxWords} words.
+
+RULES:
+- You will receive the current script. Output the FULL expanded script (the entire talk from start to finish), not a patch.
+- Preserve the exact tone, structure, line breaks, repetition patterns, and pacing of the original.
+- ADD content: more call-and-response, more repetition blocks, more silence anchors (blank lines), deeper reframes, stronger identity declarations. Do not summarize or cut anything.
+- Do not be concise. Do not summarize. You must produce at least ${minWords} words.
+- Keep short lines and blank lines. Return ONLY the script, no quotes or labels.`;
+  const userContent = `Expand this pep talk to ${minWords}-${maxWords} words. Preserve tone and structure; add content.\n\nContext: ${userText.trim()}${outcome ? `\nOutcome: ${outcome}` : ""}${obstacle ? `\nObstacle: ${obstacle}` : ""}\n\nCURRENT SCRIPT:\n${existingScript}`;
+  const completion = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: expansionPrompt },
+      { role: "user", content: userContent },
+    ],
+    max_tokens: Math.ceil(maxWords * 1.2),
+    temperature: 0.6,
+  });
+  const expanded = completion.choices[0]?.message?.content?.trim();
+  return expanded ? expanded.replace(/^["']|["']$/g, "").trim() : existingScript;
+}
 
 // Shared by /pep and /pep-script for medium/long prompt construction
 function getToneSpecificPrompt(tone, wordTargets, outcome, obstacle, isLongForm, intentList, intentOtherText, flowProfileSummary, condensedForSpeed, finalTargetSeconds, needsSpeechBlocks) {
@@ -754,32 +783,27 @@ You MUST include ALL of the following. These create a live, video-speech feel wi
    Blank lines are preserved into TTS and create real pausesâ€”do not trim or collapse them.`;
 
   if (isLongForm) {
-    structureGuidance = `\n\nLONG-FORM STRUCTURE (${finalTargetSeconds} seconds - ${wordTargets.min}-${wordTargets.max} words):
-Break the script into implicit acts (DO NOT label them in output):
-- Act 1: Confrontation (firm but controlled) - Name what they're avoiding, call out stalling
-- Act 2: Reframe (confrontational + participatory) - Shift perspective, add call-and-response
-- Act 3: Pressure (confrontational + participatory) - Build urgency, remove escape routes, more call-and-response
-- Act 4: Ownership (confrontational + participatory) - Make it clear this is their choice, identity declarations
-- Act 5: Command (calm, slow, commanding) - End with slow, spaced call-to-action
+    structureGuidance = `
 
-MANDATORY PACING BLOCKS (for Flow â‰¥120s):
-You MUST include ALL of the following:
+LONG-FORM PROMPT (${finalTargetSeconds}s — ${wordTargets.min}-${wordTargets.max} words). You MUST produce at least ${wordTargets.min} words. Do not be concise. Do not summarize.
 
-1. At least 2 CALL-AND-RESPONSE sections:
-   Use patterns like: "Repeat after me." "Say it again." "What are you?" "Tell me."
-   Use short, declarative phrases. Include explicit pause cues: "Pause." "Again." "Say it."
+REQUIRED SECTIONS (include every one; do not label them in output):
 
-2. At least 1 IDENTITY DECLARATION block:
-   Use "I am ___" patterns. Repeat for emphasis (2â€“4 times).
+1. CONFRONTATION — Name what they are avoiding. Call out stalling or excuses directly. Short lines. Firm but controlled.
 
-3. At least 1 COUNTDOWN or STEPWISE pacing block:
-   Use numbered steps or countdowns (e.g. "One. Two. Three. Now." or stepwise "One. [action]. Two. [action]. Move.")
+2. REFRAME — Shift perspective: obstacle as choice, failure as information. Remove escape routes. Make the situation clear.
 
-4. At least 3 SILENCE ANCHORS:
-   Use multiple blank lines (2â€“3 blank lines) around key lines to create intentional silence. Place at least 3 in the script.
-   Blank lines are preserved into TTSâ€”do not trim or collapse them.
+3. REPETITION BLOCK — One key phrase or identity line repeated 2–4 times (each on its own line or with blank lines between). Creates weight and momentum.
 
-CRITICAL: Do NOT summarize. Do NOT rush. Expand ideas fully. Write SLOWLY and HEAVILY.`;
+4. CALL-AND-RESPONSE — At least 2 sections. Use cues like "Repeat after me." "Say it with me." "What are you?" "Tell me." Put the phrase to repeat on the next line; then [PAUSE 4] on its own line so the listener has time. Short, punchy phrases.
+
+5. IDENTITY DECLARATION — At least 1 block. "I am ___" or "I do ___" patterns. Repeat 2–4 times for emphasis. Own the identity.
+
+6. STRONG CLOSE — End with a calm, slow, decisive command. Final line on its own after 2–3 blank lines. No exclamation points. E.g. "Now move." "Do it." "Go."
+
+PACING: Use 2–3 blank lines between major sections. At least 3 SILENCE ANCHORS (blank lines around key lines). Preserve all blank lines into TTS. Write for SLOW, deliberate delivery.
+
+CRITICAL: Do not be concise. Do not summarize. You must produce at least ${wordTargets.min} words. Expand fully. Write SLOWLY and HEAVILY.`;
   } else if (needsSpeechBlocks) {
     structureGuidance = `\n\nSTRUCTURE (Direct/No Excuses â‰¥60s - short lines, live speech feel):
 1. Name the resistance - what's blocking them (short lines, tone-appropriate opening)
@@ -805,7 +829,7 @@ ORIGINALITY: Fully original. No copying, paraphrasing, or famous quotes. Create 
 
 STRUCTURE: Build arcâ€”name situation â†’ reframe â†’ raise stakes â†’ ownership/choice â†’ decisive close. Use short lines and blank lines for rhythm. Vary sentence length; single-word lines for impact. Call-and-response when fitting. Write for a listener; create a moment of choice with your own wording.
 
-CRITICAL LENGTH: Hit ${wordTargets.min}-${wordTargets.max} words. Do NOT summarize or rush. Expand fully. Only trim if over ${Math.floor(wordTargets.max * 1.1)} words.
+CRITICAL LENGTH: You must produce at least ${wordTargets.min} words. Do not be concise. Do not summarize. Hit ${wordTargets.min}-${wordTargets.max} words. Expand fully. Only trim if over ${Math.floor(wordTargets.max * 1.1)} words.
 
 WRITING: Beats, not paragraphs. Short lines; blank lines = pauses. No sentence >15 words for direct/no_excuses. No exclamation points.
 
@@ -866,8 +890,8 @@ STRUCTURAL & RHETORICAL RULES (ABSTRACT â€” APPLY THESE PATTERNS WITH ORIGI
    - The talk should feel like it builds to a peak and then resolves, not like a flat list of tips.
 
 CRITICAL LENGTH REQUIREMENTS:
-- Hit the target word count range (${wordTargets.min}-${wordTargets.max} words). Output will be regenerated if under minimum.
-- Do NOT summarize. Do NOT rush. Expand ideas fully.
+- You must produce at least ${wordTargets.min} words. Do not be concise. Do not summarize.
+- Hit the target word count range (${wordTargets.min}-${wordTargets.max} words). Expand ideas fully.
 - Only trim if output exceeds ${Math.floor(wordTargets.max * 1.1)} words (never trim long-form unless over max by >10%).
 
 WRITING STYLE - GOLD STANDARD (MANDATORY):
@@ -976,7 +1000,7 @@ app.post("/pep", async (req, res) => {
     
     // Check rate limit per IP
     if (!checkRateLimit(clientIP)) {
-      console.log(`â±ï¸ Rate limit exceeded for IP: ${clientIP}`);
+      console.log(`[INFO] Rate limit exceeded for IP: ${clientIP}`);
       return res.status(429).json({ error: "Rate limit exceeded. Maximum 20 requests per hour per IP." });
     }
     
@@ -984,13 +1008,13 @@ app.post("/pep", async (req, res) => {
 
     // Validate input
     if (!userText || typeof userText !== "string" || userText.trim().length === 0) {
-      console.log("âŒ PEP request failed: Missing or empty userText");
+      console.log("[FAIL] PEP request failed: Missing or empty userText");
       return res.status(400).json({ error: "userText must be a non-empty string" });
     }
 
     const maxUserTextChars = tier === "free" ? 500 : 1500;
     if (userText.length > maxUserTextChars) {
-      console.log(`âŒ PEP request failed: userText too long (${userText.length} chars, max ${maxUserTextChars})`);
+      console.log(`[INFO] PEP request failed: userText too long (${userText.length} chars, max ${maxUserTextChars})`);
       return res.status(400).json({ error: `userText too long (max ${maxUserTextChars} characters)` });
     }
 
@@ -1030,13 +1054,13 @@ app.post("/pep", async (req, res) => {
     // Enforce tier-based max limits
     const tierMaxSeconds = tier === "flow" ? 300 : tier === "pro" ? 90 : 30;
     if (finalTargetSeconds > tierMaxSeconds) {
-      console.log(`âŒ PEP request failed: targetSeconds ${finalTargetSeconds} exceeds tier max ${tierMaxSeconds}`);
+      console.log(`[INFO] PEP request failed: targetSeconds ${finalTargetSeconds} exceeds tier max ${tierMaxSeconds}`);
       return res.status(400).json({ error: `targetSeconds cannot exceed ${tierMaxSeconds} seconds for ${tier} tier` });
     }
 
     // Validate targetSeconds is a valid option
     if (!wordCountMap[finalTargetSeconds]) {
-      console.log(`âŒ PEP request failed: Invalid targetSeconds ${finalTargetSeconds}`);
+      console.log(`[INFO] PEP request failed: Invalid targetSeconds ${finalTargetSeconds}`);
       return res.status(400).json({ error: "Invalid targetSeconds. Must be one of: 30, 60, 90, 120, 180, 300" });
     }
     
@@ -1057,7 +1081,7 @@ app.post("/pep", async (req, res) => {
     let openAIVoice = "alloy"; // Default for free users
     if (voiceProfileId) {
       if (!VOICE_PROFILE_MAP[voiceProfileId]) {
-        console.log(`âŒ PEP request failed: Invalid voiceProfileId ${voiceProfileId}`);
+        console.log(`[INFO] PEP request failed: Invalid voiceProfileId ${voiceProfileId}`);
         return res.status(400).json({ error: `Invalid voiceProfileId. Must be one of: ${Object.keys(VOICE_PROFILE_MAP).join(", ")}` });
       }
       openAIVoice = VOICE_PROFILE_MAP[voiceProfileId];
@@ -1068,14 +1092,14 @@ app.post("/pep", async (req, res) => {
 
     // Safety evaluation - check BEFORE generating pep talk (skip LLM for 30s to speed up; keyword check only)
     const isShortPep = finalTargetSeconds <= 30;
-    console.log(`ðŸ” Evaluating safety for: ${userText.substring(0, 50)}...`);
+    console.log(`[INFO] Evaluating safety for: ${userText.substring(0, 50)}...`);
     const safetyCheck = await evaluateRequestSafety(userText.trim(), isShortPep);
     
     if (!safetyCheck.isSafe) {
-      console.log(`ðŸš« Unsafe request detected: ${userText.substring(0, 50)}... (reason: ${safetyCheck.reason})`);
+      console.log(`[INFO] Unsafe request detected: ${userText.substring(0, 50)}... (reason: ${safetyCheck.reason})`);
       const refusalText = await generateRefusalResponse(userText.trim(), tone, estimatedMaxChars);
       
-      console.log(`ðŸš« Refusal generated: ${refusalText.length} chars`);
+      console.log(`[INFO] Refusal generated: ${refusalText.length} chars`);
       
       // Return refusal WITHOUT generating TTS audio
       return res.json({
@@ -1090,12 +1114,12 @@ app.post("/pep", async (req, res) => {
       const maxPro = parseInt(process.env.MAX_PRO_DAILY_REQUESTS || "200", 10);
       
       if (tier === "free" && dailyCounts.free >= maxFree) {
-        console.log(`ðŸš« Daily free cap reached: ${dailyCounts.free}/${maxFree}`);
+        console.log(`[INFO] Daily free cap reached: ${dailyCounts.free}/${maxFree}`);
         return res.status(429).json({ error: "Daily capacity reached" });
       }
       
       if (tier === "pro" && dailyCounts.pro >= maxPro) {
-        console.log(`ðŸš« Daily pro cap reached: ${dailyCounts.pro}/${maxPro}`);
+        console.log(`[INFO] Daily pro cap reached: ${dailyCounts.pro}/${maxPro}`);
         return res.status(429).json({ error: "Daily capacity reached" });
       }
     }
@@ -1146,7 +1170,8 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       systemPrompt = getToneSpecificPrompt(tone, wordTargets, outcome, obstacle, isLongForm, validIntents, intentOtherStr, profileSummaryStr, useCondensedLongForm, finalTargetSeconds, needsSpeechBlocks);
     }
 
-    console.log(`ðŸ“ Generating pep talk script: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}, wordTarget=${wordTargets.min}-${wordTargets.max}, isLongForm=${isLongForm}, voiceProfileId=${voiceProfileId || 'default'}, openAIVoice=${openAIVoice}, userText=${userText.substring(0, 50)}...`);
+    const scriptGenStart = Date.now();
+    console.log("[SCRIPT] Generating pep talk: tier=" + tier + ", tone=" + tone + ", targetSeconds=" + finalTargetSeconds + ", wordTarget=" + wordTargets.min + "-" + wordTargets.max + ", isLongForm=" + isLongForm);
 
     // Generate pep talk script using OpenAI (tighter tokens + lower temp for 30s = faster)
     const estimatedMaxTokens = isShortPep
@@ -1179,45 +1204,29 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     // Clean up the script: remove quotes if wrapped; trim only leading/trailing.
     scriptText = scriptText.replace(/^["']|["']$/g, '').trim();
 
-    // Count words; min threshold = below min by >10% triggers regenerate (skip for short peps to save time)
     const minWordsRequired = wordTargets.min;
-    const minThreshold = Math.floor(minWordsRequired * 0.9); // below this = regenerate
-    const maxWordsAllowed = Math.floor(wordTargets.max * 1.1); // only trim if over this
+    const minThreshold = Math.floor(minWordsRequired * 0.9);
+    const maxWordsAllowed = Math.floor(wordTargets.max * 1.1);
 
     let finalScript = scriptText;
     let currentWordCount = scriptText.split(/\s+/).filter(word => word.length > 0).length;
-    console.log(`ðŸ“Š Script word count: ${currentWordCount} (target: ${wordTargets.min}-${wordTargets.max}, max allowed: ${maxWordsAllowed})`);
+    const initialWordCount = currentWordCount;
+    console.log("[SCRIPT] Initial word count: " + initialWordCount + " (target: " + wordTargets.min + "-" + wordTargets.max + ", max allowed: " + maxWordsAllowed + ")");
 
-    // If output is below minimum by >10%, regenerate up to 2 tries (skip for 30/60s to keep generation fast)
-    const skipRegeneration = finalTargetSeconds <= 60;
-    for (let tryNum = 0; tryNum < 2 && currentWordCount < minThreshold && !skipRegeneration; tryNum++) {
-      console.log(`âš ï¸ Script under minimum (${currentWordCount} < ${minThreshold}), regenerate attempt ${tryNum + 1}/2...`);
-      const expansionCompletion = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt + `\n\nCRITICAL: The previous attempt was only ${currentWordCount} words. You MUST expand to at least ${minWordsRequired} words. Do NOT summarize. Add more detail, more call-and-response sections, more repetition, more pacing blocks. Write SLOWLY and HEAVILY.`,
-          },
-          {
-            role: "user",
-            content: `Create a pep talk for: ${userText.trim()}${outcome ? `\n\nDesired outcome: ${outcome}` : ''}${obstacle ? `\n\nReal obstacle: ${obstacle}` : ''}\n\nEXPAND the previous script. Add more content. Target ${minWordsRequired}-${wordTargets.max} words. Include all required pacing blocks.`,
-          },
-        ],
-        max_tokens: estimatedMaxTokens,
-        temperature: 0.7,
-      });
-      const expandedText = expansionCompletion.choices[0]?.message?.content?.trim();
-      if (expandedText) {
-        finalScript = expandedText.replace(/^["']|["']$/g, '').trim();
-        currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
-        console.log(`ðŸ“Š Regenerated script word count: ${currentWordCount} (target: ${minWordsRequired}-${wordTargets.max})`);
-      }
+    const skipExpansion = finalTargetSeconds <= 60;
+    if (currentWordCount < minThreshold && !skipExpansion) {
+      console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), running expansion pass...");
+      finalScript = await expandScriptToTarget(client, finalScript, wordTargets, userText, outcome, obstacle);
+      currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
+      console.log("[SCRIPT] Expanded word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
     }
+
+    const scriptGenDuration = Date.now() - scriptGenStart;
+    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + (currentWordCount !== initialWordCount ? ", expanded: " + currentWordCount : "") + ")");
 
     // Only trim if exceeds max by >10% (never trim long-form unless over max*1.1)
     if (currentWordCount > maxWordsAllowed) {
-      console.log(`âš ï¸ Script exceeds max word count (${currentWordCount} > ${maxWordsAllowed}), trimming...`);
+      console.log("[SCRIPT] Script exceeds max word count (" + currentWordCount + " > " + maxWordsAllowed + "), trimming...");
       const targetWords = wordTargets.max;
       let reconstructed = '';
       let currentWordIndex = 0;
@@ -1252,7 +1261,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       // Preserve trailing blank lines but limit excessive whitespace (max 3 consecutive blank lines)
       finalScript = reconstructed.replace(/\n{4,}/g, '\n\n\n').replace(/^\s+|\s+$/g, '');
       currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
-      console.log(`âœ‚ï¸ Trimmed script to ${currentWordCount} words (ending on complete sentence)`);
+      console.log("[SCRIPT] Trimmed script to " + currentWordCount + " words (ending on complete sentence)");
     }
 
     // For short peps (â‰¤30s), collapse multiple blank lines to avoid overly long pauses in TTS.
@@ -1262,7 +1271,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
     const finalWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
     const blankLineCount = (finalScript.match(/\n\s*\n/g) || []).length;
-    console.log(`âœ… Script generated: ${finalWordCount} words (target: ${wordTargets.min}-${wordTargets.max}), ${finalScript.length} chars, tier: ${tier}, targetSeconds: ${finalTargetSeconds}`);
+    console.log(`[INFO] Script generated: ${finalWordCount} words (target: ${wordTargets.min}-${wordTargets.max}), ${finalScript.length} chars, tier: ${tier}, targetSeconds: ${finalTargetSeconds}`);
 
     // Clean display text (no delivery cues) for reading view and client display, and ensure it ends on a full sentence.
     // Use this same text as the basis for TTS so the audio never ends on a dangling fragment (e.g. "three" with no closing sentence).
@@ -1310,7 +1319,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
         logUsage(tier, displayText.length, clientIP);
         sendLine({ type: "done" });
       } catch (streamErr) {
-        console.error("âŒ PEP stream error:", streamErr.message);
+        console.error("[FAIL] PEP stream error:", streamErr.message);
         sendLine({ type: "error", error: streamErr.message });
       }
       res.end();
@@ -1386,7 +1395,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     };
     res.json(payload);
   } catch (err) {
-    console.error("âŒ PEP error:", err.message);
+    console.error("[FAIL] PEP error:", err.message);
     
     // Provide helpful error messages
     if (err.message.includes("API key")) {
@@ -1411,7 +1420,7 @@ app.post("/pep-script", async (req, res) => {
     checkAndResetDailyCounts();
 
     if (!checkRateLimit(clientIP)) {
-      console.log(`â±ï¸ Rate limit exceeded for IP: ${clientIP}`);
+      console.log(`[INFO] Rate limit exceeded for IP: ${clientIP}`);
       return res.status(429).json({ error: "Rate limit exceeded. Maximum 20 requests per hour per IP." });
     }
 
@@ -1429,13 +1438,13 @@ app.post("/pep-script", async (req, res) => {
     } = req.body;
 
     if (!userText || typeof userText !== "string" || userText.trim().length === 0) {
-      console.log("âŒ PEP-SCRIPT request failed: Missing or empty userText");
+      console.log("[FAIL] PEP-SCRIPT request failed: Missing or empty userText");
       return res.status(400).json({ error: "userText must be a non-empty string" });
     }
 
     const maxUserTextChars = tier === "free" ? 500 : 1500;
     if (userText.length > maxUserTextChars) {
-      console.log(`âŒ PEP-SCRIPT request failed: userText too long (${userText.length} chars, max ${maxUserTextChars})`);
+      console.log(`[INFO] PEP-SCRIPT request failed: userText too long (${userText.length} chars, max ${maxUserTextChars})`);
       return res.status(400).json({ error: `userText too long (max ${maxUserTextChars} characters)` });
     }
 
@@ -1472,12 +1481,12 @@ app.post("/pep-script", async (req, res) => {
 
     const tierMaxSeconds = tier === "flow" ? 300 : tier === "pro" ? 90 : 30;
     if (finalTargetSeconds > tierMaxSeconds) {
-      console.log(`âŒ PEP-SCRIPT request failed: targetSeconds ${finalTargetSeconds} exceeds tier max ${tierMaxSeconds}`);
+      console.log(`[INFO] PEP-SCRIPT request failed: targetSeconds ${finalTargetSeconds} exceeds tier max ${tierMaxSeconds}`);
       return res.status(400).json({ error: `targetSeconds cannot exceed ${tierMaxSeconds} seconds for ${tier} tier` });
     }
 
     if (!wordCountMap[finalTargetSeconds]) {
-      console.log(`âŒ PEP-SCRIPT request failed: Invalid targetSeconds ${finalTargetSeconds}`);
+      console.log(`[INFO] PEP-SCRIPT request failed: Invalid targetSeconds ${finalTargetSeconds}`);
       return res.status(400).json({ error: "Invalid targetSeconds. Must be one of: 30, 60, 90, 120, 180, 300" });
     }
 
@@ -1495,7 +1504,7 @@ app.post("/pep-script", async (req, res) => {
     let openAIVoice = "alloy";
     if (voiceProfileId) {
       if (!VOICE_PROFILE_MAP[voiceProfileId]) {
-        console.log(`âŒ PEP-SCRIPT request failed: Invalid voiceProfileId ${voiceProfileId}`);
+        console.log(`[INFO] PEP-SCRIPT request failed: Invalid voiceProfileId ${voiceProfileId}`);
         return res.status(400).json({ error: `Invalid voiceProfileId. Must be one of: ${Object.keys(VOICE_PROFILE_MAP).join(", ")}` });
       }
       openAIVoice = VOICE_PROFILE_MAP[voiceProfileId];
@@ -1503,10 +1512,10 @@ app.post("/pep-script", async (req, res) => {
 
     const estimatedMaxChars = wordTargets.max * 6;
     const isShortPep = finalTargetSeconds <= 30;
-    console.log(`ðŸ” [SCRIPT] Evaluating safety for: ${userText.substring(0, 50)}...`);
+    console.log(`[INFO] [SCRIPT] Evaluating safety for: ${userText.substring(0, 50)}...`);
     const safetyCheck = await evaluateRequestSafety(userText.trim(), isShortPep);
     if (!safetyCheck.isSafe) {
-      console.log(`ðŸš« [SCRIPT] Unsafe request detected: ${userText.substring(0, 50)}... (reason: ${safetyCheck.reason})`);
+      console.log(`[INFO] [SCRIPT] Unsafe request detected: ${userText.substring(0, 50)}... (reason: ${safetyCheck.reason})`);
       const refusalText = await generateRefusalResponse(userText.trim(), tone, estimatedMaxChars);
       return res.status(200).json({
         requestId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1559,7 +1568,8 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       systemPrompt = getToneSpecificPrompt(tone, wordTargets, outcome, obstacle, isLongForm, validIntents, intentOtherStr, profileSummaryStr, useCondensedLongForm, finalTargetSeconds, needsSpeechBlocks);
     }
 
-    console.log(`ðŸ“ [SCRIPT] Generating pep script only: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}`);
+    const scriptGenStart = Date.now();
+        console.log(`[INFO] [SCRIPT] Generating pep script only: tier=${tier}, tone=${tone}, targetSeconds=${finalTargetSeconds}`);
 
     const estimatedMaxTokens = finalTargetSeconds <= 30 ? 100 : Math.ceil(wordTargets.max * 0.75 * 1.2);
     const scriptTemperature = finalTargetSeconds <= 30 ? 0.5 : 0.7;
@@ -1589,38 +1599,22 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
     let finalScript = scriptText;
     let currentWordCount = scriptText.split(/\s+/).filter((word) => word.length > 0).length;
-    console.log(`ðŸ“Š [SCRIPT] Word count: ${currentWordCount} (target: ${wordTargets.min}-${wordTargets.max}, max allowed: ${maxWordsAllowed})`);
+    const initialWordCount = currentWordCount;
+    console.log("[SCRIPT] Initial word count: " + initialWordCount + " (target: " + wordTargets.min + "-" + wordTargets.max + ", max allowed: " + maxWordsAllowed + ")");
 
-    const skipRegeneration = finalTargetSeconds <= 60;
-    for (let tryNum = 0; tryNum < 2 && currentWordCount < minThreshold && !skipRegeneration; tryNum++) {
-      console.log(`âš ï¸ [SCRIPT] Under minimum (${currentWordCount} < ${minThreshold}), regenerate attempt ${tryNum + 1}/2...`);
-      const expansionCompletion = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              systemPrompt +
-              `\n\nCRITICAL: The previous attempt was only ${currentWordCount} words. You MUST expand to at least ${minWordsRequired} words. Do NOT summarize. Add more detail, more call-and-response sections, more repetition, more pacing blocks. Write SLOWLY and HEAVILY.`,
-          },
-          {
-            role: "user",
-            content: `Create a pep talk for: ${userText.trim()}${outcome ? `\n\nDesired outcome: ${outcome}` : ""}${obstacle ? `\n\nReal obstacle: ${obstacle}` : ""}\n\nEXPAND the previous script. Add more content. Target ${minWordsRequired}-${wordTargets.max} words. Include all required pacing blocks.`,
-          },
-        ],
-        max_tokens: estimatedMaxTokens,
-        temperature: 0.7,
-      });
-      const expandedText = expansionCompletion.choices[0]?.message?.content?.trim();
-      if (expandedText) {
-        finalScript = expandedText.replace(/^["']|["']$/g, "").trim();
-        currentWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
-        console.log(`ðŸ“Š [SCRIPT] Regenerated word count: ${currentWordCount} (target: ${minWordsRequired}-${wordTargets.max})`);
-      }
+    const skipExpansion = finalTargetSeconds <= 60;
+    if (currentWordCount < minThreshold && !skipExpansion) {
+      console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), running expansion pass...");
+      finalScript = await expandScriptToTarget(client, finalScript, wordTargets, userText, outcome, obstacle);
+      currentWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
+      console.log("[SCRIPT] Expanded word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
     }
 
+    const scriptGenDuration = Date.now() - scriptGenStart;
+    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + (currentWordCount !== initialWordCount ? ", expanded: " + currentWordCount : "") + ")");
+
     if (currentWordCount > maxWordsAllowed) {
-      console.log(`âš ï¸ [SCRIPT] Exceeds max word count (${currentWordCount} > ${maxWordsAllowed}), trimming...`);
+      console.log("[SCRIPT] Exceeds max word count (" + currentWordCount + " > " + maxWordsAllowed + "), trimming...");
       const targetWords = wordTargets.max;
       let reconstructed = "";
       let currentWordIndex = 0;
@@ -1650,7 +1644,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
       finalScript = reconstructed.replace(/\n{4,}/g, "\n\n\n").replace(/^\s+|\s+$/g, "");
       currentWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
-      console.log(`âœ‚ï¸ [SCRIPT] Trimmed to ${currentWordCount} words`);
+      console.log(`[INFO] [SCRIPT] Trimmed to ${currentWordCount} words`);
     }
 
     if (finalTargetSeconds <= 30) {
@@ -1659,7 +1653,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
     const finalWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
     const estDurationSec = Math.max(20, Math.round((finalWordCount / 150) * 60));
-    console.log(`âœ… [SCRIPT] Done: ${finalWordCount} words, estDurationSec=${estDurationSec}`);
+    console.log(`[INFO] [SCRIPT] Done: ${finalWordCount} words, estDurationSec=${estDurationSec}`);
 
     const displayText = ensureEndsOnSentence(stripCuesToDisplay(finalScript));
     const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1673,7 +1667,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       },
     });
   } catch (err) {
-    console.error("âŒ PEP-SCRIPT error:", err.message || err);
+    console.error("[FAIL] PEP-SCRIPT error:", err.message || err);
     return res.status(500).json({ error: "Pep script generation failed: " + (err.message || String(err)) });
   }
 });
@@ -1711,7 +1705,7 @@ app.post("/pep-audio", async (req, res) => {
     checkAndResetDailyCounts();
 
     if (!checkRateLimit(clientIP)) {
-      console.log(`â±ï¸ Rate limit exceeded for IP: ${clientIP}`);
+      console.log(`[INFO] Rate limit exceeded for IP: ${clientIP}`);
       return res.status(429).json({ error: "Rate limit exceeded. Maximum 20 requests per hour per IP." });
     }
 
@@ -1725,7 +1719,7 @@ app.post("/pep-audio", async (req, res) => {
     } = req.body;
 
     if (!scriptText || typeof scriptText !== "string" || scriptText.trim().length === 0) {
-      console.log("âŒ PEP-AUDIO request failed: Missing or empty scriptText");
+      console.log("[FAIL] PEP-AUDIO request failed: Missing or empty scriptText");
       return res.status(400).json({ error: "scriptText must be a non-empty string" });
     }
 
@@ -1755,7 +1749,7 @@ app.post("/pep-audio", async (req, res) => {
     let openAIVoice = "alloy";
     if (voiceProfileId) {
       if (!VOICE_PROFILE_MAP[voiceProfileId]) {
-        console.log(`âŒ PEP-AUDIO request failed: Invalid voiceProfileId ${voiceProfileId}`);
+        console.log(`[INFO] PEP-AUDIO request failed: Invalid voiceProfileId ${voiceProfileId}`);
         return res.status(400).json({ error: `Invalid voiceProfileId. Must be one of: ${Object.keys(VOICE_PROFILE_MAP).join(", ")}` });
       }
       openAIVoice = VOICE_PROFILE_MAP[voiceProfileId];
@@ -1804,7 +1798,7 @@ app.post("/pep-audio", async (req, res) => {
       durationMs: estDurationMs,
     });
   } catch (err) {
-    console.error("âŒ PEP-AUDIO error:", err.message || err);
+    console.error("[FAIL] PEP-AUDIO error:", err.message || err);
     return res.status(500).json({ error: "Pep audio generation failed: " + (err.message || String(err)) });
   }
 });
@@ -1816,17 +1810,17 @@ app.post("/tts", async (req, res) => {
 
     // Validate text exists and is a string
     if (!text || typeof text !== "string") {
-      console.log("âŒ TTS request failed: Missing or invalid text");
+      console.log("[FAIL] TTS request failed: Missing or invalid text");
       return res.status(400).json({ error: "Missing or invalid text" });
     }
 
     // Enforce max length (~90 seconds)
     if (text.length > 1400) {
-      console.log(`âŒ TTS request failed: Text too long (${text.length} chars, max 1400)`);
+      console.log(`[INFO] TTS request failed: Text too long (${text.length} chars, max 1400)`);
       return res.status(400).json({ error: "Text too long (max 1400 characters)" });
     }
 
-    console.log(`ðŸŽ¤ Generating TTS: ${text.length} chars, voice: ${voice}`);
+    console.log(`[INFO] Generating TTS: ${text.length} chars, voice: ${voice}`);
 
     // Call OpenAI TTS API
     const mp3 = await client.audio.speech.create({
@@ -1840,11 +1834,11 @@ app.post("/tts", async (req, res) => {
     buffer = await normalizeAudioToLufs(buffer);
     const audioBase64 = buffer.toString("base64");
 
-    console.log(`âœ… TTS generated successfully: ${audioBase64.length} base64 chars`);
+    console.log(`[INFO] TTS generated successfully: ${audioBase64.length} base64 chars`);
 
     res.json({ audioBase64: audioBase64 });
   } catch (err) {
-    console.error("âŒ TTS error:", err.message);
+    console.error("[FAIL] TTS error:", err.message);
     res.status(500).json({ error: "TTS generation failed" });
   }
 });
