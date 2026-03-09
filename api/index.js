@@ -1059,14 +1059,14 @@ app.post("/pep", async (req, res) => {
       return res.status(400).json({ error: "Invalid tone. Must be 'easy', 'steady', 'direct', 'blunt', or 'no_excuses'" });
     }
 
-    // Map targetSeconds to WORD targets (tuned to match actual TTS speed)
+    // Map targetSeconds to WORD targets (~2.76 words/sec observed pacing)
     const wordCountMap = {
-      30: { min: 80, max: 110 },
-      60: { min: 220, max: 260 },
-      90: { min: 330, max: 380 },
-      120: { min: 320, max: 380 },
-      180: { min: 600, max: 680 }, // Flow 3-min: enough words + slower TTS speed to fill ~3 min
-      300: { min: 700, max: 850 },
+      30: { min: 75, max: 95 },
+      60: { min: 150, max: 180 },
+      90: { min: 230, max: 260 },
+      120: { min: 300, max: 340 },
+      180: { min: 460, max: 520 },
+      300: { min: 800, max: 880 },
     };
 
     // Default targetSeconds based on tier if not provided; coerce number (client may send string)
@@ -1234,7 +1234,8 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     scriptText = scriptText.replace(/^["']|["']$/g, '').trim();
 
     const minWordsRequired = wordTargets.min;
-    const minThreshold = Math.floor(minWordsRequired * 0.9);
+    // Only expand when clearly too short (below 85% of min). Within 15% of min = no expansion.
+    const minThreshold = Math.floor(minWordsRequired * 0.85);
     const maxWordsAllowed = Math.floor(wordTargets.max * 1.1);
 
     let finalScript = scriptText;
@@ -1369,7 +1370,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
         if (tier === "free") dailyCounts.free++;
         else if (tier === "pro") dailyCounts.pro++;
         logUsage(tier, displayText.length, clientIP);
-        console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + finalWordCount + " | ttsChars=" + ttsInputChars + " | audioDurationSec=N/A (streaming)");
+        console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + finalWordCount + " | audioDurationSec=N/A (streaming)");
         if (useChunkedTts && segmentsWithPauses.length > 0) {
           console.log("[DIAG] chunked TTS: all " + segmentsWithPauses.length + " segments synthesized and sent");
         }
@@ -1428,7 +1429,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
 
     const audioDurationSec = await getMp3DurationSeconds(fullBuf);
     console.log("[DIAG] audioDurationSec=" + (audioDurationSec != null ? audioDurationSec.toFixed(2) : "N/A"));
-    console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + finalWordCount + " | ttsChars=" + ttsInputChars + " | audioDurationSec=" + (audioDurationSec != null ? audioDurationSec.toFixed(2) : "N/A"));
+    console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + finalWordCount + " | audioDurationSec=" + (audioDurationSec != null ? audioDurationSec.toFixed(2) : "N/A"));
 
     console.log("[AUDIO] audio file save start");
     const saveStart = Date.now();
@@ -1522,12 +1523,12 @@ app.post("/pep-script", async (req, res) => {
     }
 
     const wordCountMap = {
-      30: { min: 80, max: 110 },
-      60: { min: 220, max: 260 },
-      90: { min: 330, max: 380 },
-      120: { min: 320, max: 380 },
-      180: { min: 600, max: 680 },
-      300: { min: 700, max: 850 },
+      30: { min: 75, max: 95 },
+      60: { min: 150, max: 180 },
+      90: { min: 230, max: 260 },
+      120: { min: 300, max: 340 },
+      180: { min: 460, max: 520 },
+      300: { min: 800, max: 880 },
     };
 
     let finalTargetSeconds =
@@ -1655,7 +1656,8 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     scriptText = scriptText.replace(/^["']|["']$/g, "").trim();
 
     const minWordsRequired = wordTargets.min;
-    const minThreshold = Math.floor(minWordsRequired * 0.9);
+    // Only expand when clearly too short (below 85% of min). Within 15% of min = no expansion.
+    const minThreshold = Math.floor(minWordsRequired * 0.85);
     const maxWordsAllowed = Math.floor(wordTargets.max * 1.1);
 
     let finalScript = scriptText;
@@ -1842,7 +1844,7 @@ app.post("/pep-audio", async (req, res) => {
 
     const pepAudioDurationSec = await getMp3DurationSeconds(fullBuf);
     console.log("[DIAG] pep-audio audioDurationSec=" + (pepAudioDurationSec != null ? pepAudioDurationSec.toFixed(2) : "N/A"));
-    console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + pepAudioWordCount + " | ttsChars=" + pepAudioTtsChars + " | audioDurationSec=" + (pepAudioDurationSec != null ? pepAudioDurationSec.toFixed(2) : "N/A") + " (pep-audio)");
+    console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + pepAudioWordCount + " | audioDurationSec=" + (pepAudioDurationSec != null ? pepAudioDurationSec.toFixed(2) : "N/A") + " (pep-audio)");
 
     console.log("[AUDIO] audio file save start");
     const saveStart = Date.now();
