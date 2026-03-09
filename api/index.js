@@ -679,6 +679,7 @@ Generate a refusal response in Pep's voice that redirects to something construct
 /**
  * Expansion pass: expand existing script to target word range without full regenerate.
  * Adds specific structural elements (repetition, call-and-response, stronger close) to increase duration naturally.
+ * NOTE: For most shortfalls we now prefer deterministic append blocks (see appendPacingBlocksIfShort) instead of calling this.
  */
 async function expandScriptToTarget(client, existingScript, wordTargets, userText, outcome, obstacle) {
   const minWords = wordTargets.min;
@@ -711,6 +712,61 @@ You MUST add these three elements (weave them in; do not just pad with filler):
   });
   const expanded = completion.choices[0]?.message?.content?.trim();
   return expanded ? expanded.replace(/^["']|["']$/g, "").trim() : existingScript;
+}
+
+// Append deterministic pacing blocks (repetition + stronger close) when script is clearly too short.
+// This avoids an extra LLM call and increases duration in a controlled way.
+function appendPacingBlocksIfShort(script, wordTargets, finalTargetSeconds) {
+  let updated = script;
+  let usedAppend = false;
+
+  const repetitionBlock = `
+
+Say it with me.
+
+I do hard things.
+
+Again.
+
+I do hard things.
+
+[PAUSE 4]
+`;
+
+  const closingBlock = `
+
+Listen.
+You are not waiting for motivation.
+You are making a decision.
+Right now.
+
+[PAUSE 4]
+
+Now move.
+`;
+
+  const countWords = (text) =>
+    text.split(/\s+/).filter((w) => w.length > 0).length;
+
+  const minWordsRequired = wordTargets.min;
+  let currentWords = countWords(updated);
+
+  if (currentWords >= minWordsRequired) {
+    return { script: updated, usedAppend: false };
+  }
+
+  // Always add repetition block first.
+  updated = updated.trimEnd() + repetitionBlock;
+  usedAppend = true;
+  currentWords = countWords(updated);
+
+  // If still below minWordsRequired, add closing block.
+  if (currentWords < minWordsRequired) {
+    updated = updated.trimEnd() + closingBlock;
+    currentWords = countWords(updated);
+  }
+
+  return { script: updated, usedAppend };
 }
 
 // Shared by /pep and /pep-script for medium/long prompt construction
@@ -1242,27 +1298,30 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
     scriptText = scriptText.replace(/^["']|["']$/g, '').trim();
 
     const minWordsRequired = wordTargets.min;
-    // Only expand when clearly too short (below 85% of min). Within 15% of min = no expansion.
+    // Only append when clearly too short (below 85% of min). Within 15% of min = no append.
     const minThreshold = Math.floor(minWordsRequired * 0.85);
     const maxWordsAllowed = Math.floor(wordTargets.max * 1.1);
 
     let finalScript = scriptText;
     let currentWordCount = scriptText.split(/\s+/).filter(word => word.length > 0).length;
     const initialWordCount = currentWordCount;
-    let expandedWordCount = null;
+    let appendBlocksUsed = false;
     console.log("[SCRIPT] Initial word count: " + initialWordCount + " (target: " + wordTargets.min + "-" + wordTargets.max + ", max allowed: " + maxWordsAllowed + ")");
 
-    const skipExpansion = finalTargetSeconds <= 60;
-    if (currentWordCount < minThreshold && !skipExpansion) {
-      console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), running expansion pass...");
-      finalScript = await expandScriptToTarget(client, finalScript, wordTargets, userText, outcome, obstacle);
-      currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
-      expandedWordCount = currentWordCount;
-      console.log("[SCRIPT] Expanded word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
+    const skipAppend = finalTargetSeconds <= 60;
+    if (currentWordCount < minThreshold && !skipAppend) {
+      console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), appending pacing blocks...");
+      const appended = appendPacingBlocksIfShort(finalScript, wordTargets, finalTargetSeconds);
+      if (appended && appended.script && appended.script !== finalScript) {
+        finalScript = appended.script;
+        appendBlocksUsed = appended.usedAppend;
+        currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
+        console.log("[SCRIPT] After append blocks word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
+      }
     }
 
     const scriptGenDuration = Date.now() - scriptGenStart;
-    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + (expandedWordCount != null ? ", expanded: " + expandedWordCount : "") + ")");
+    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + ")");
 
     // Only trim if exceeds max by >10% (never trim long-form unless over max*1.1)
     if (currentWordCount > maxWordsAllowed) {
@@ -1332,8 +1391,8 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
 
     // ----- Diagnostic logging (custom pep duration diagnosis)
     console.log("[DIAG] initialScriptWordCount=" + initialWordCount);
-    console.log("[DIAG] expandedScriptWordCount=" + (expandedWordCount != null ? expandedWordCount : "N/A"));
     console.log("[DIAG] finalScriptWordCount=" + finalWordCount);
+    console.log("[DIAG] appendBlocksUsed=" + (appendBlocksUsed ? "yes" : "no"));
     console.log("[DIAG] finalScriptCharCount=" + finalScript.length);
     const ttsInputChars = useChunkedTts
       ? segmentsWithPauses.reduce((sum, s) => sum + (s.text ? s.text.length : 0), 0)
@@ -1664,25 +1723,30 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
     scriptText = scriptText.replace(/^["']|["']$/g, "").trim();
 
     const minWordsRequired = wordTargets.min;
-    // Only expand when clearly too short (below 85% of min). Within 15% of min = no expansion.
+    // Only append when clearly too short (below 85% of min). Within 15% of min = no append.
     const minThreshold = Math.floor(minWordsRequired * 0.85);
     const maxWordsAllowed = Math.floor(wordTargets.max * 1.1);
 
     let finalScript = scriptText;
     let currentWordCount = scriptText.split(/\s+/).filter((word) => word.length > 0).length;
     const initialWordCount = currentWordCount;
+    let appendBlocksUsed = false;
     console.log("[SCRIPT] Initial word count: " + initialWordCount + " (target: " + wordTargets.min + "-" + wordTargets.max + ", max allowed: " + maxWordsAllowed + ")");
 
-    const skipExpansion = finalTargetSeconds <= 60;
-    if (currentWordCount < minThreshold && !skipExpansion) {
-      console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), running expansion pass...");
-      finalScript = await expandScriptToTarget(client, finalScript, wordTargets, userText, outcome, obstacle);
-      currentWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
-      console.log("[SCRIPT] Expanded word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
+    const skipAppend = finalTargetSeconds <= 60;
+    if (currentWordCount < minThreshold && !skipAppend) {
+      console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), appending pacing blocks...");
+      const appended = appendPacingBlocksIfShort(finalScript, wordTargets, finalTargetSeconds);
+      if (appended && appended.script && appended.script !== finalScript) {
+        finalScript = appended.script;
+        appendBlocksUsed = appended.usedAppend;
+        currentWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
+        console.log("[SCRIPT] After append blocks word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
+      }
     }
 
     const scriptGenDuration = Date.now() - scriptGenStart;
-    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + (currentWordCount !== initialWordCount ? ", expanded: " + currentWordCount : "") + ")");
+    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + ")");
 
     if (currentWordCount > maxWordsAllowed) {
       console.log("[SCRIPT] Exceeds max word count (" + currentWordCount + " > " + maxWordsAllowed + "), trimming...");
