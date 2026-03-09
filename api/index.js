@@ -718,31 +718,54 @@ You MUST add these three elements (weave them in; do not just pad with filler):
 // This avoids an extra LLM call and increases duration in a controlled way.
 function appendPacingBlocksIfShort(script, wordTargets, finalTargetSeconds) {
   let updated = script;
-  let usedAppend = false;
+  let blocksAppended = 0;
 
+  // Block 1 — Repetition Block (~24 words)
   const repetitionBlock = `
+
+Listen.
+
+You are not stuck.
+
+You are not weak.
+
+You are not finished.
+
+You are simply at a moment that is asking you one question.
+
+Are you going to step forward?
+`;
+
+  // Block 2 — Call & Response Block (~24–28 words)
+  const callResponseBlock = `
 
 Say it with me.
 
-I do hard things.
+I show up.
 
 Again.
 
-I do hard things.
+I show up.
 
-[PAUSE 4]
+One more time.
+
+I show up.
+
+Because today does not decide who I am.
+
+I decide that.
 `;
 
-  const closingBlock = `
+  // Block 3 — Escalation Closing Block (~26–30 words)
+  const escalationBlock = `
 
-Listen.
-You are not waiting for motivation.
-You are making a decision.
-Right now.
+So stand up.
 
-[PAUSE 4]
+Take the step.
 
-Now move.
+Do the thing you have been avoiding.
+
+Because the version of you waiting on the other side of action is stronger than the one sitting here doubting.
 `;
 
   const countWords = (text) =>
@@ -752,21 +775,37 @@ Now move.
   let currentWords = countWords(updated);
 
   if (currentWords >= minWordsRequired) {
-    return { script: updated, usedAppend: false };
+    return { script: updated, blocksAppended: 0 };
   }
 
-  // Always add repetition block first.
-  updated = updated.trimEnd() + repetitionBlock;
-  usedAppend = true;
-  currentWords = countWords(updated);
+  const shortage = minWordsRequired - currentWords;
 
-  // If still below minWordsRequired, add closing block.
-  if (currentWords < minWordsRequired) {
-    updated = updated.trimEnd() + closingBlock;
-    currentWords = countWords(updated);
+  // Determine how many blocks to append based on shortage.
+  let neededBlocks = 0;
+  if (shortage >= 50) {
+    neededBlocks = 3;
+  } else if (shortage >= 30) {
+    neededBlocks = 2;
+  } else if (shortage >= 20) {
+    neededBlocks = 1;
+  } else {
+    neededBlocks = 0;
   }
 
-  return { script: updated, usedAppend };
+  if (neededBlocks >= 1) {
+    updated = updated.trimEnd() + repetitionBlock;
+    blocksAppended++;
+  }
+  if (neededBlocks >= 2) {
+    updated = updated.trimEnd() + callResponseBlock;
+    blocksAppended++;
+  }
+  if (neededBlocks >= 3) {
+    updated = updated.trimEnd() + escalationBlock;
+    blocksAppended++;
+  }
+
+  return { script: updated, blocksAppended };
 }
 
 // Shared by /pep and /pep-script for medium/long prompt construction
@@ -1314,7 +1353,7 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
       const appended = appendPacingBlocksIfShort(finalScript, wordTargets, finalTargetSeconds);
       if (appended && appended.script && appended.script !== finalScript) {
         finalScript = appended.script;
-        appendBlocksUsed = appended.usedAppend;
+        appendBlocksUsed = appended.blocksAppended || 0;
         currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
         console.log("[SCRIPT] After append blocks word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
       }
@@ -1392,7 +1431,7 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
     // ----- Diagnostic logging (custom pep duration diagnosis)
     console.log("[DIAG] initialScriptWordCount=" + initialWordCount);
     console.log("[DIAG] finalScriptWordCount=" + finalWordCount);
-    console.log("[DIAG] appendBlocksUsed=" + (appendBlocksUsed ? "yes" : "no"));
+    console.log("[DIAG] appendBlocksUsed=" + (appendBlocksUsed ? appendBlocksUsed : 0));
     console.log("[DIAG] finalScriptCharCount=" + finalScript.length);
     const ttsInputChars = useChunkedTts
       ? segmentsWithPauses.reduce((sum, s) => sum + (s.text ? s.text.length : 0), 0)
@@ -1730,7 +1769,7 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
     let finalScript = scriptText;
     let currentWordCount = scriptText.split(/\s+/).filter((word) => word.length > 0).length;
     const initialWordCount = currentWordCount;
-    let appendBlocksUsed = false;
+    let appendBlocksUsed = 0;
     console.log("[SCRIPT] Initial word count: " + initialWordCount + " (target: " + wordTargets.min + "-" + wordTargets.max + ", max allowed: " + maxWordsAllowed + ")");
 
     const skipAppend = finalTargetSeconds <= 60;
@@ -1739,7 +1778,7 @@ Short lines. Blank lines = pauses. No exclamation points. Last line = complete c
       const appended = appendPacingBlocksIfShort(finalScript, wordTargets, finalTargetSeconds);
       if (appended && appended.script && appended.script !== finalScript) {
         finalScript = appended.script;
-        appendBlocksUsed = appended.usedAppend;
+        appendBlocksUsed = appended.blocksAppended || 0;
         currentWordCount = finalScript.split(/\s+/).filter((word) => word.length > 0).length;
         console.log("[SCRIPT] After append blocks word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
       }
