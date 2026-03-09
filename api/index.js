@@ -678,7 +678,7 @@ Generate a refusal response in Pep's voice that redirects to something construct
 
 /**
  * Expansion pass: expand existing script to target word range without full regenerate.
- * Preserves tone, structure, repetition, and pacing. Call once when initial script is under minimum.
+ * Adds specific structural elements (repetition, call-and-response, stronger close) to increase duration naturally.
  */
 async function expandScriptToTarget(client, existingScript, wordTargets, userText, outcome, obstacle) {
   const minWords = wordTargets.min;
@@ -687,11 +687,19 @@ async function expandScriptToTarget(client, existingScript, wordTargets, userTex
 
 RULES:
 - You will receive the current script. Output the FULL expanded script (the entire talk from start to finish), not a patch.
-- Preserve the exact tone, structure, line breaks, repetition patterns, and pacing of the original.
-- ADD content: more call-and-response, more repetition blocks, more silence anchors (blank lines), deeper reframes, stronger identity declarations. Do not summarize or cut anything.
+- Preserve the exact tone, structure, and pacing of the original. Do not summarize or cut anything.
+
+You MUST add these three elements (weave them in; do not just pad with filler):
+
+1. ONE REPETITION BLOCK: One key phrase or identity line repeated 2–4 times, each on its own line or with a blank line between. Creates weight and momentum.
+
+2. ONE CALL-AND-RESPONSE BLOCK: A cue like "Repeat after me." or "Say it with me." then the phrase to repeat on the next line, then [PAUSE 4] on its own line so the listener has time. Short, punchy phrase.
+
+3. ONE STRONGER CLOSING SECTION: Expand the ending with a calm, decisive build—then the final command on its own line after 2–3 blank lines. No exclamation points.
+
 - Do not be concise. Do not summarize. You must produce at least ${minWords} words.
 - Keep short lines and blank lines. Return ONLY the script, no quotes or labels.`;
-  const userContent = `Expand this pep talk to ${minWords}-${maxWords} words. Preserve tone and structure; add content.\n\nContext: ${userText.trim()}${outcome ? `\nOutcome: ${outcome}` : ""}${obstacle ? `\nObstacle: ${obstacle}` : ""}\n\nCURRENT SCRIPT:\n${existingScript}`;
+  const userContent = `Expand this pep talk to ${minWords}-${maxWords} words. Add: one repetition block, one call-and-response block, one stronger closing section. Preserve tone and structure.\n\nContext: ${userText.trim()}${outcome ? `\nOutcome: ${outcome}` : ""}${obstacle ? `\nObstacle: ${obstacle}` : ""}\n\nCURRENT SCRIPT:\n${existingScript}`;
   const completion = await client.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [
@@ -1061,12 +1069,12 @@ app.post("/pep", async (req, res) => {
 
     // Map targetSeconds to WORD targets (~2.76 words/sec observed pacing)
     const wordCountMap = {
-      30: { min: 75, max: 95 },
-      60: { min: 150, max: 180 },
-      90: { min: 230, max: 260 },
-      120: { min: 300, max: 340 },
-      180: { min: 460, max: 520 },
-      300: { min: 800, max: 880 },
+      30: { min: 70, max: 90 },
+      60: { min: 120, max: 150 },
+      90: { min: 210, max: 240 },
+      120: { min: 280, max: 330 },
+      180: { min: 430, max: 500 },
+      300: { min: 700, max: 820 },
     };
 
     // Default targetSeconds based on tier if not provided; coerce number (client may send string)
@@ -1154,9 +1162,9 @@ app.post("/pep", async (req, res) => {
     }
 
 
-    // Tiered prompts to reduce tokens and LLM latency: short (30s), medium (60s/90s), full or condensed long (120s/180s)
+    // Lighter prompts for 30/60/90s to reduce script generation overhead; reserve full long-form structure for 120s+
     const isMediumPep = finalTargetSeconds === 60 || finalTargetSeconds === 90;
-    const useCondensedLongForm = isLongForm; // 120s and 180s get condensed full prompt (same content, fewer words)
+    const useCondensedLongForm = isLongForm; // 120s and 180s get condensed long-form prompt
     let systemPrompt;
     if (isShortPep) {
       const shortClosings = {
@@ -1189,12 +1197,12 @@ Fully original. No famous quotes or copied phrases.`;
       const speechBlocksNote = needsSpeechBlocks
         ? "\nInclude: 1 call-and-response block, 1 identity chant (phrase repeated 2-4x), 1 countdown or stepwise ramp, and 3+ silence anchors (blank lines around key lines). Short lines only."
         : "";
-      systemPrompt = `You are Pep, a motivational coach. Write a pep: ${wordTargets.min}-${wordTargets.max} words (~${finalTargetSeconds} seconds when spoken).${ctx}
+      systemPrompt = `You are Pep, a motivational coach. Write a pep: ${wordTargets.min}-${wordTargets.max} words (~${finalTargetSeconds}s).${ctx}
 
 Tone: ${tone}. ${tr.opening} ${tr.closing}
-STRUCTURE: 1. Name the resistance 2. Reframe 3. Clear next step or participation 4. Strong close (one clear final sentence).${speechBlocksNote}
+STRUCTURE: 1. Name the resistance 2. Reframe 3. Next step or participation 4. Strong close (one clear final sentence).${speechBlocksNote}
 
-Use short lines. Blank lines create pauses. No exclamation points. Last line MUST be a complete closing sentenceâ€”never end mid-thought. Fully original; no famous quotes.`;
+Short lines. Blank lines = pauses. No exclamation points. Last line = complete closing sentenceâ€”never end mid-thought. Original only; no famous quotes.`;
     } else {
       systemPrompt = getToneSpecificPrompt(tone, wordTargets, outcome, obstacle, isLongForm, validIntents, intentOtherStr, profileSummaryStr, useCondensedLongForm, finalTargetSeconds, needsSpeechBlocks);
     }
@@ -1523,12 +1531,12 @@ app.post("/pep-script", async (req, res) => {
     }
 
     const wordCountMap = {
-      30: { min: 75, max: 95 },
-      60: { min: 150, max: 180 },
-      90: { min: 230, max: 260 },
-      120: { min: 300, max: 340 },
-      180: { min: 460, max: 520 },
-      300: { min: 800, max: 880 },
+      30: { min: 70, max: 90 },
+      60: { min: 120, max: 150 },
+      90: { min: 210, max: 240 },
+      120: { min: 280, max: 330 },
+      180: { min: 430, max: 500 },
+      300: { min: 700, max: 820 },
     };
 
     let finalTargetSeconds =
@@ -1620,12 +1628,12 @@ Fully original. No famous quotes or copied phrases.`;
       const speechBlocksNote = needsSpeechBlocks
         ? "\nInclude: 1 call-and-response block, 1 identity chant (phrase repeated 2-4x), 1 countdown or stepwise ramp, and 3+ silence anchors (blank lines around key lines). Short lines only."
         : "";
-      systemPrompt = `You are Pep, a motivational coach. Write a pep: ${wordTargets.min}-${wordTargets.max} words (~${finalTargetSeconds} seconds when spoken).${ctx}
+      systemPrompt = `You are Pep, a motivational coach. Write a pep: ${wordTargets.min}-${wordTargets.max} words (~${finalTargetSeconds}s).${ctx}
 
 Tone: ${tone}. ${tr.opening} ${tr.closing}
-STRUCTURE: 1. Name the resistance 2. Reframe 3. Clear next step or participation 4. Strong close (one clear final sentence).${speechBlocksNote}
+STRUCTURE: 1. Name the resistance 2. Reframe 3. Next step or participation 4. Strong close (one clear final sentence).${speechBlocksNote}
 
-Use short lines. Blank lines create pauses. No exclamation points. Last line MUST be a complete closing sentenceâ€”never end mid-thought. Fully original; no famous quotes.`;
+Short lines. Blank lines = pauses. No exclamation points. Last line = complete closing sentenceâ€”never end mid-thought. Original only; no famous quotes.`;
     } else {
       systemPrompt = getToneSpecificPrompt(tone, wordTargets, outcome, obstacle, isLongForm, validIntents, intentOtherStr, profileSummaryStr, useCondensedLongForm, finalTargetSeconds, needsSpeechBlocks);
     }
