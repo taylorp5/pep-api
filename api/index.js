@@ -53,6 +53,35 @@ function reencodeMp3ToSpeechBitrate(inputBuffer) {
   });
 }
 
+/**
+ * Get duration in seconds of an MP3 buffer via ffprobe. Returns null if ffprobe fails or is unavailable.
+ */
+function getMp3DurationSeconds(mp3Buffer) {
+  return new Promise((resolve) => {
+    const tmpFile = path.join(PEP_AUDIO_TEMP_DIR, `_probe_${Date.now()}.mp3`);
+    const dir = path.dirname(tmpFile);
+    if (!fs.existsSync(dir)) {
+      try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { resolve(null); return; }
+    }
+    fs.writeFile(tmpFile, mp3Buffer, (err) => {
+      if (err) { resolve(null); return; }
+      const ff = spawn("ffprobe", [
+        "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", tmpFile,
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      ff.stdout.on("data", (d) => { out += d.toString(); });
+      ff.on("error", () => { fs.unlink(tmpFile, () => {}); resolve(null); });
+      ff.on("close", (code) => {
+        fs.unlink(tmpFile, () => {});
+        if (code !== 0) { resolve(null); return; }
+        const sec = parseFloat(out.trim());
+        resolve(Number.isFinite(sec) ? sec : null);
+      });
+    });
+  });
+}
+
 /** Target LUFS for speech (broadcast-style consistent volume). */
 const TTS_LUFS_TARGET = -16;
 /** True peak ceiling in dBFS to prevent clipping. */
@@ -1211,6 +1240,7 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     let finalScript = scriptText;
     let currentWordCount = scriptText.split(/\s+/).filter(word => word.length > 0).length;
     const initialWordCount = currentWordCount;
+    let expandedWordCount = null;
     console.log("[SCRIPT] Initial word count: " + initialWordCount + " (target: " + wordTargets.min + "-" + wordTargets.max + ", max allowed: " + maxWordsAllowed + ")");
 
     const skipExpansion = finalTargetSeconds <= 60;
@@ -1218,11 +1248,12 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       console.log("[SCRIPT] Under minimum (" + currentWordCount + " < " + minThreshold + "), running expansion pass...");
       finalScript = await expandScriptToTarget(client, finalScript, wordTargets, userText, outcome, obstacle);
       currentWordCount = finalScript.split(/\s+/).filter(word => word.length > 0).length;
+      expandedWordCount = currentWordCount;
       console.log("[SCRIPT] Expanded word count: " + currentWordCount + " (target: " + minWordsRequired + "-" + wordTargets.max + ")");
     }
 
     const scriptGenDuration = Date.now() - scriptGenStart;
-    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + (currentWordCount !== initialWordCount ? ", expanded: " + currentWordCount : "") + ")");
+    console.log("[SCRIPT] Total script generation duration: " + scriptGenDuration + "ms (initial: " + initialWordCount + (expandedWordCount != null ? ", expanded: " + expandedWordCount : "") + ")");
 
     // Only trim if exceeds max by >10% (never trim long-form unless over max*1.1)
     if (currentWordCount > maxWordsAllowed) {
@@ -1290,6 +1321,27 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
     const segmentsWithPauses = allowChunkedTts ? parseScriptWithCues(finalScript, defaultPauseSeconds) : [];
     const useChunkedTts = allowChunkedTts && segmentsWithPauses.length > 1;
 
+    // ----- Diagnostic logging (custom pep duration diagnosis)
+    console.log("[DIAG] initialScriptWordCount=" + initialWordCount);
+    console.log("[DIAG] expandedScriptWordCount=" + (expandedWordCount != null ? expandedWordCount : "N/A"));
+    console.log("[DIAG] finalScriptWordCount=" + finalWordCount);
+    console.log("[DIAG] finalScriptCharCount=" + finalScript.length);
+    const ttsInputChars = useChunkedTts
+      ? segmentsWithPauses.reduce((sum, s) => sum + (s.text ? s.text.length : 0), 0)
+      : scriptForTts.length;
+    console.log("[DIAG] ttsInputSource=" + (useChunkedTts ? "chunked (" + segmentsWithPauses.length + " segments from finalScript)" : "full (scriptForTts from finalScript->displayText->stripCuesForTts)"));
+    console.log("[DIAG] TTS uses exact finalScript-derived text: yes (displayText=ensureEndsOnSentence(stripCuesToDisplay(finalScript)); scriptForTts=stripCuesForTts(displayText); chunks=parseScriptWithCues(finalScript))");
+    console.log("[DIAG] ttsInputCharCount=" + ttsInputChars);
+    if (useChunkedTts && segmentsWithPauses.length > 0) {
+      segmentsWithPauses.forEach((seg, i) => {
+        const w = (seg.text || "").trim().split(/\s+/).filter(Boolean).length;
+        const c = (seg.text || "").length;
+        console.log("[DIAG] chunk " + i + ": words=" + w + " chars=" + c);
+      });
+      const totalChunkWords = segmentsWithPauses.reduce((sum, s) => sum + (s.text || "").trim().split(/\s+/).filter(Boolean).length, 0);
+      console.log("[DIAG] chunked total: " + segmentsWithPauses.length + " segments, totalWords=" + totalChunkWords + " totalChars=" + ttsInputChars);
+    }
+
     // ----- Streaming path: send script then TTS segments one-by-one so client can start playback on first chunk
     if (wantStream) {
       res.setHeader("Content-Type", "application/x-ndjson");
@@ -1317,6 +1369,10 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
         if (tier === "free") dailyCounts.free++;
         else if (tier === "pro") dailyCounts.pro++;
         logUsage(tier, displayText.length, clientIP);
+        console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + finalWordCount + " | ttsChars=" + ttsInputChars + " | audioDurationSec=N/A (streaming)");
+        if (useChunkedTts && segmentsWithPauses.length > 0) {
+          console.log("[DIAG] chunked TTS: all " + segmentsWithPauses.length + " segments synthesized and sent");
+        }
         sendLine({ type: "done" });
       } catch (streamErr) {
         console.error("[FAIL] PEP stream error:", streamErr.message);
@@ -1367,7 +1423,12 @@ Use short lines. Blank lines create pauses. No exclamation points. Last line MUS
       }
       audioSegments = base64s;
       segmentPauseDurations = pauseDurations;
+      console.log("[DIAG] chunked TTS: all " + segmentsWithPauses.length + " segments synthesized and included");
     }
+
+    const audioDurationSec = await getMp3DurationSeconds(fullBuf);
+    console.log("[DIAG] audioDurationSec=" + (audioDurationSec != null ? audioDurationSec.toFixed(2) : "N/A"));
+    console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + finalWordCount + " | ttsChars=" + ttsInputChars + " | audioDurationSec=" + (audioDurationSec != null ? audioDurationSec.toFixed(2) : "N/A"));
 
     console.log("[AUDIO] audio file save start");
     const saveStart = Date.now();
@@ -1764,6 +1825,10 @@ app.post("/pep-audio", async (req, res) => {
         : 1.0;
 
     const scriptForTts = stripCuesForTts(scriptText);
+    const pepAudioWordCount = scriptForTts.trim().split(/\s+/).filter(Boolean).length;
+    const pepAudioTtsChars = scriptForTts.length;
+    console.log("[DIAG] pep-audio scriptWordCount=" + pepAudioWordCount + " ttsInputCharCount=" + pepAudioTtsChars);
+
     const fullMp3 = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: openAIVoice,
@@ -1774,6 +1839,10 @@ app.post("/pep-audio", async (req, res) => {
     console.log("[AUDIO] TTS request end (" + (Date.now() - totalStart) + "ms)");
     if (finalTargetSeconds > 30) fullBuf = await normalizeAudioToLufs(fullBuf);
     fullBuf = await reencodeMp3ToSpeechBitrate(fullBuf);
+
+    const pepAudioDurationSec = await getMp3DurationSeconds(fullBuf);
+    console.log("[DIAG] pep-audio audioDurationSec=" + (pepAudioDurationSec != null ? pepAudioDurationSec.toFixed(2) : "N/A"));
+    console.log("[SUMMARY] targetSeconds=" + finalTargetSeconds + " | finalWords=" + pepAudioWordCount + " | ttsChars=" + pepAudioTtsChars + " | audioDurationSec=" + (pepAudioDurationSec != null ? pepAudioDurationSec.toFixed(2) : "N/A") + " (pep-audio)");
 
     console.log("[AUDIO] audio file save start");
     const saveStart = Date.now();
